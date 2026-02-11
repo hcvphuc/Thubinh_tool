@@ -1,0 +1,46 @@
+{
+    "id": "com.gemini.v2",
+    "name": "Gemini V2",
+    "version": "1.0.3",
+    "main": "index.html",
+    "host": [
+        {
+            "app": "PS",
+            "minVersion": "24.0.0"
+        }
+    ],
+    "manifestVersion": 5,
+    "entrypoints": [
+        {
+            "type": "panel",
+            "id": "geminiV2Panel",
+            "label": {
+                "default": "Gemini V2"
+            },
+            "minimumSize": {
+                "width": 250,
+                "height": 300
+            },
+            "maximumSize": {
+                "width": 1000,
+                "height": 2000
+            },
+            "preferredSize": {
+                "width": 300,
+                "height": 600
+            }
+        }
+    ],
+    "requiredPermissions": {
+        "network": {
+            "domains": [
+                "https://generativelanguage.googleapis.com",
+                "https://image.pollinations.ai",
+                "https://*.googleapis.com",
+                "https://*.pollinations.ai"
+            ]
+        },
+        "localFileSystem": "fullAccess",
+        "clipboard": "readAndWrite"
+    }
+}
