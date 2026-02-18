@@ -17,6 +17,31 @@ function readFileAsBase64(file) {
   });
 }
 
+// ========== HELPER: Compress base64 image for API (resize + JPEG quality) ==========
+function compressBase64Image(base64, maxSize = 1024, quality = 0.8) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      // Resize if larger than maxSize
+      if (width > maxSize || height > maxSize) {
+        const ratio = Math.min(maxSize / width, maxSize / height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      const compressed = canvas.toDataURL('image/jpeg', quality).split(',')[1];
+      resolve(compressed);
+    };
+    img.onerror = () => resolve(base64); // Fallback to original on error
+    img.src = `data:image/jpeg;base64,${base64}`;
+  });
+}
+
 // ========== HELPER: Download base64 image ==========
 function downloadBase64(base64Data, mimeType, filename) {
   const link = document.createElement('a');
@@ -494,26 +519,29 @@ function App() {
       const hasRefs = refImages.length > 0;
       addLog(hasRefs ? `Using ${refImages.length} reference image(s)` : 'No reference images, using text prompt only');
 
+      // Pre-compress images for faster API upload
+      const compressedRefs = hasRefs ? await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75))) : [];
+      const compressedSubject = await compressBase64Image(templateSubjectImage, 1536, 0.85);
+      addLog(`Compressed: subject=${(compressedSubject.length / 1024).toFixed(0)}KB, refs=${compressedRefs.length}`);
+
       const doReplace = async (attempt, qcFix) => {
         setStatus(`AD ${attempt === 1 ? '2/3' : '2R/3'}: Thay background...`);
         addLog(`--- STEP 2: BG Replace #${attempt} ---`);
 
-        let editPrompt = `Edit this photo by replacing ONLY the background. Keep every single pixel of the person(s) COMPLETELY UNCHANGED - their face, body, pose, clothing, accessories, hair, expression must remain 100% identical to the original photo. NEW BACKGROUND: ${template.prompt} PHOTO ANALYSIS: ${adInfo} CRITICAL PHOTOGRAPHY RULES: 1. DEPTH OF FIELD: The new background must have the SAME depth of field as the original photo. Match the bokeh style. 2. PERSPECTIVE: Match the exact same camera angle, focal length, and perspective distortion. 3. LIGHTING: Background lighting must come from the SAME direction as the light on the person(s). Match color temperature. 4. COLOR GRADING: Unified, consistent color grading. 5. GROUND CONTACT: Person's feet/base must naturally connect with the new ground/floor surface. 6. REALISM: Everything in the background must look like a real photograph, not AI-generated. The result must look like this person was ACTUALLY photographed in this location.`;
-        if (hasRefs) editPrompt += ' REFERENCE IMAGES are provided showing the EXACT studio setup and style to replicate. Match the reference images as closely as possible for background style, props, colors, and atmosphere.';
-        if (qcFix) editPrompt += ' ADDITIONAL FIX: ' + qcFix;
+        let editPrompt = `Replace ONLY the background. Keep person(s) 100% unchanged (face, body, pose, clothes). NEW BG: ${template.prompt}. ANALYSIS: ${adInfo}. RULES: Match original DOF/bokeh, camera angle, lighting direction/color temp. Natural ground contact. Photorealistic result.`;
+        if (hasRefs) editPrompt += ' Match REFERENCE IMAGES style exactly.';
+        if (qcFix) editPrompt += ' FIX: ' + qcFix;
 
-        // Build parts array with optional reference images
+        // Build parts array with compressed images
         const parts = [];
-        // Add reference images first so AI sees them
         if (hasRefs) {
-          parts.push({ text: 'REFERENCE STUDIO IMAGES (replicate this style):' });
-          refImages.forEach(refB64 => {
+          parts.push({ text: 'REFERENCE STUDIO IMAGES:' });
+          compressedRefs.forEach(refB64 => {
             parts.push({ inlineData: { mimeType: 'image/jpeg', data: refB64 } });
           });
         }
-        // Add subject photo
-        parts.push({ text: 'SUBJECT PHOTO (keep person unchanged):' });
-        parts.push({ inlineData: { mimeType: 'image/jpeg', data: templateSubjectImage } });
+        parts.push({ text: 'SUBJECT PHOTO (keep unchanged):' });
+        parts.push({ inlineData: { mimeType: 'image/jpeg', data: compressedSubject } });
         parts.push({ text: editPrompt });
 
         const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
@@ -528,7 +556,7 @@ function App() {
         const data = await res.json();
         const img = extractImage(data);
         if (!img) throw new Error('No image returned');
-        addLog('Done! ' + img.data.length + ' chars');
+        addLog('Done! ' + (img.data.length / 1024).toFixed(0) + 'KB');
         addCost('image', 1);
         addCost('textInput', 1500);
         return img;
@@ -1041,7 +1069,10 @@ function App() {
     const newImages = [];
     for (const file of files.slice(0, 3)) {
       const b64 = await readFileAsBase64(file);
-      newImages.push(b64);
+      // Compress for storage — 1024px max, JPEG 80% quality
+      const compressed = await compressBase64Image(b64, 1024, 0.8);
+      newImages.push(compressed);
+      addLog(`Ref compressed: ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
     }
 
     const existing = (templateData[refUploadTarget]?.refImages) || [];
