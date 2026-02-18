@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import './App.css';
 import { saveTemplateData, getAllTemplateData, deleteTemplateData, migrateOldRefs } from './db.js';
+import { validateFaceAnatomy } from './FaceQC.js';
 
 // ========== HELPER: Read file as base64 ==========
 function readFileAsBase64(file) {
@@ -383,7 +384,6 @@ function App() {
     setLoading(true);
     addLog('=== COMPOSITE ===');
     try {
-      setStatus('Ghép nền với AI...');
       let prompt = 'Composite the subject onto this background.';
       if (optKeepFace) prompt += ' Keep the subject face exactly the same.';
       if (optKeepPose) prompt += ' Maintain exact same body pose.';
@@ -391,32 +391,59 @@ function App() {
       prompt += ' Make it photorealistic.';
       if (compositePrompt) prompt += ' ' + compositePrompt;
 
-      const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: 'BACKGROUND IMAGE:' },
-              { inlineData: { mimeType: 'image/jpeg', data: bgImage } },
-              { text: 'SUBJECT TO COMPOSITE:' },
-              { inlineData: { mimeType: 'image/jpeg', data: subjectImage } },
-              { text: 'INSTRUCTION: ' + prompt }
-            ]
-          }],
-          generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: compositeAspectRatio } }
-        })
-      });
-      if (!res.ok) throw new Error('API failed: ' + res.status);
-      const data = await res.json();
-      const img = extractImage(data);
-      if (img) {
-        setResultImage(img);
-        setStatus('Xong!');
+      let finalResult = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        setStatus(attempt === 1 ? 'Ghép nền với AI...' : 'Đang sửa lỗi giải phẫu...');
+        let currentPrompt = prompt;
+        if (attempt > 1) currentPrompt += ` URGENT FIX: Previous result had anatomical issues. Correct: ${finalResult?._qcIssues || 'face/body anatomy'}. Verify eye symmetry and skin texture.`;
+
+        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: 'BACKGROUND IMAGE:' },
+                { inlineData: { mimeType: 'image/jpeg', data: bgImage } },
+                { text: 'SUBJECT TO COMPOSITE:' },
+                { inlineData: { mimeType: 'image/jpeg', data: subjectImage } },
+                { text: 'INSTRUCTION: ' + currentPrompt }
+              ]
+            }],
+            generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: compositeAspectRatio } }
+          })
+        });
+        if (!res.ok) throw new Error('API failed: ' + res.status);
+        const data = await res.json();
+        const img = extractImage(data);
+        if (!img) throw new Error('No image');
         addCost('image', 1);
         addCost('textInput', 2000);
-        addLog('Composite done!');
-      } else throw new Error('No image');
+
+        // QC Check
+        setStatus('Kiểm tra giải phẫu...');
+        addLog(`QC Check (${attempt}/2)...`);
+        const qc = await validateFaceAnatomy(subjectImage, img.data, key.trim());
+        addCost('textInput', 800);
+
+        if (qc.pass) {
+          addLog(`✓ QC Passed (Score: ${qc.score})`);
+          setResultImage(img);
+          setStatus('Xong! (QC ✅)');
+          addLog('Composite done!');
+          finalResult = img;
+          break;
+        } else {
+          addLog(`⚠ QC Fail (${attempt}/2): ${qc.issues}`);
+          finalResult = img;
+          finalResult._qcIssues = qc.issues;
+          if (attempt === 2) {
+            setResultImage(img);
+            setStatus('Xong! (QC ⚠️ Retry)');
+            addLog('Accepting after retry limit.');
+          }
+        }
+      }
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -613,32 +640,59 @@ function App() {
     setLoading(true);
     addLog('=== FACE SWAP ===');
     try {
-      setStatus('Đang thay thế khuôn mặt...');
-      const prompt = `You are a professional face replacement AI. Replace the face in the TARGET IMAGE with the face from the REFERENCE IMAGE. CRITICAL: 1. Face must be EXACTLY identical to REFERENCE. 2. Keep pose, body from TARGET. 3. Match lighting naturally. 4. Result must look completely natural. IMAGE 1 = REFERENCE FACE. IMAGE 2 = TARGET.`;
-      const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: prompt },
-              { inlineData: { mimeType: 'image/jpeg', data: faceRefImage } },
-              { inlineData: { mimeType: 'image/jpeg', data: faceTargetImage } }
-            ]
-          }],
-          generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } }
-        })
-      });
-      if (!res.ok) throw new Error('API failed: ' + res.status);
-      const data = await res.json();
-      const img = extractImage(data);
-      if (img) {
-        setResultImage(img);
-        setStatus('Face swap xong!');
+      const basePrompt = `You are a professional face replacement AI. Replace the face in the TARGET IMAGE with the face from the REFERENCE IMAGE. CRITICAL: 1. Face must be EXACTLY identical to REFERENCE. 2. Keep pose, body from TARGET. 3. Match lighting naturally. 4. Result must look completely natural. IMAGE 1 = REFERENCE FACE. IMAGE 2 = TARGET.`;
+
+      let finalResult = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        setStatus(attempt === 1 ? 'Đang thay thế khuôn mặt...' : 'Đang sửa lỗi giải phẫu...');
+        let prompt = basePrompt;
+        if (attempt > 1) prompt += ` URGENT FIX: Previous result had anatomical issues: ${finalResult?._qcIssues || 'face anatomy error'}. Correct eye symmetry, skin texture, and facial proportions.`;
+
+        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{
+              parts: [
+                { text: prompt },
+                { inlineData: { mimeType: 'image/jpeg', data: faceRefImage } },
+                { inlineData: { mimeType: 'image/jpeg', data: faceTargetImage } }
+              ]
+            }],
+            generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } }
+          })
+        });
+        if (!res.ok) throw new Error('API failed: ' + res.status);
+        const data = await res.json();
+        const img = extractImage(data);
+        if (!img) throw new Error('No image');
         addCost('image', 1);
         addCost('textInput', 2000);
-        addLog('Face swapped!');
-      } else throw new Error('No image');
+
+        // QC Check - compare result face with reference face
+        setStatus('Kiểm tra giải phẫu...');
+        addLog(`QC Check (${attempt}/2)...`);
+        const qc = await validateFaceAnatomy(faceRefImage, img.data, key.trim());
+        addCost('textInput', 800);
+
+        if (qc.pass) {
+          addLog(`✓ QC Passed (Score: ${qc.score})`);
+          setResultImage(img);
+          setStatus('Face swap xong! (QC ✅)');
+          addLog('Face swapped!');
+          finalResult = img;
+          break;
+        } else {
+          addLog(`⚠ QC Fail (${attempt}/2): ${qc.issues}`);
+          finalResult = img;
+          finalResult._qcIssues = qc.issues;
+          if (attempt === 2) {
+            setResultImage(img);
+            setStatus('Face swap xong! (QC ⚠️)');
+            addLog('Accepting after retry limit.');
+          }
+        }
+      }
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -714,12 +768,19 @@ function App() {
           const template = allTemplates.find(t => t.id === batchSelectedTemplate);
           if (!template) throw new Error('Template không tìm thấy');
 
-          // Collect ref images for batch
-          const refImages = template.refImages || [];
+          // Collect ref images: template refs + THUMBNAIL (if any)
+          let refImages = [...(template.refImages || [])];
+          if (template.thumbnail) {
+            // Add thumbnail as the FIRST reference (highest priority)
+            refImages = [template.thumbnail, ...refImages];
+          }
+
+          // Deduplicate refs
+          refImages = [...new Set(refImages)];
           const hasRefs = refImages.length > 0;
 
           let tplPrompt = `Generate a background based on: ${template.prompt}. Then composite the subject onto it. CRITICAL: Keep all faces, poses exactly the same. Match lighting. Photorealistic. 4K.`;
-          if (hasRefs) tplPrompt += ' REFERENCE IMAGES provided. Match the reference studio style exactly.';
+          if (hasRefs) tplPrompt += ' REFERENCE IMAGES provided (including thumbnail preview). Match the reference studio style exactly.';
 
           const parts = [];
           // Add refs
@@ -739,19 +800,69 @@ function App() {
           };
         }
 
-        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(requestBody)
-        });
-        if (!res.ok) throw new Error('API: ' + res.status);
-        const data = await res.json();
-        const img = extractImage(data);
-        if (img) {
-          addLog(`✓ ${file.name} done`);
-          results.push({ fileName: file.name, baseName, status: 'success', message: 'OK', imageData: img.data, mimeType: img.mimeType || 'image/png' });
-          addCost('image', 1);
-          addCost('textInput', 2000);
+
+
+        // ========== QC LOOP (Max 2 attempts) ==========
+        let qcIssues = '';
+        let finalImg = null;
+        let success = false;
+
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          if (attempt > 1) {
+            addLog(`⟳ Retry #${attempt} fixing: ${qcIssues}`);
+            // Append fix instruction to the last text part of prompt
+            const parts = requestBody.contents[0].parts;
+            const lastTextPart = parts[parts.length - 1];
+            if (lastTextPart && lastTextPart.text) {
+              lastTextPart.text += ` URGENT FIX: The previous result had anatomical errors: ${qcIssues}. Correct the face/body anatomy completely. Verify eye symmetry and skin texture.`;
+            }
+          }
+
+          const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+          });
+
+          if (!res.ok) throw new Error('API: ' + res.status);
+          const data = await res.json();
+          const img = extractImage(data);
+
+          if (!img) break;
+
+          // QC Check
+          addLog(`Analyzing Anatomy (${attempt}/2)...`);
+          const qc = await validateFaceAnatomy(subjectB64, img.data, key.trim());
+
+          if (qc.pass) {
+            finalImg = img;
+            success = true;
+            addLog(`✓ QC Passed (Score: ${qc.score})`);
+            break;
+          } else {
+            addLog(`⚠ QC Fail: ${qc.issues}`);
+            qcIssues = qc.issues;
+            if (attempt === 2) {
+              finalImg = img; // Accept result after max retries
+              addLog('⚠ Accepting result after retry limit.');
+            }
+          }
+        }
+
+        if (finalImg) {
+          addLog(`✓ ${file.name} saved`);
+          results.push({
+            fileName: file.name,
+            baseName,
+            status: success ? 'success' : 'warning',
+            message: success ? 'OK' : `QC Issues: ${qcIssues}`,
+            imageData: finalImg.data,
+            mimeType: finalImg.mimeType || 'image/png'
+          });
+          // Cost: count actual attempts (image gen + QC per attempt)
+          const numAttempts = success ? 1 : 2;
+          addCost('image', numAttempts);
+          addCost('textInput', numAttempts * 2500);
         } else throw new Error('No image returned');
       } catch (e) {
         addLog(`✗ ${file.name}: ${e.message}`);
@@ -775,7 +886,7 @@ function App() {
 
   // ========== BATCH: Download all results ==========
   function handleBatchDownloadAll() {
-    const successResults = batchResults.filter(r => r.status === 'success');
+    const successResults = batchResults.filter(r => r.status === 'success' || r.status === 'warning');
     successResults.forEach((r, i) => {
       setTimeout(() => downloadBase64(r.imageData, r.mimeType, `${r.baseName}_batch.png`), i * 300);
     });
@@ -1453,11 +1564,14 @@ function App() {
               {batchResults.map((r, i) => (
                 <div key={i} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 16 }}>{r.status === 'success' ? '✅' : '❌'}</span>
+                    <span style={{ fontSize: 16 }}>{r.status === 'success' ? '✅' : r.status === 'warning' ? '⚠️' : '❌'}</span>
                     <span style={{ fontSize: 13, color: 'var(--text-secondary)' }}>{r.fileName}</span>
                   </div>
-                  {r.status === 'success' && (
+                  {(r.status === 'success' || r.status === 'warning') && (
                     <button className="btn btn-sm btn-secondary" onClick={() => handleBatchDownloadOne(r)}>💾</button>
+                  )}
+                  {r.status === 'warning' && (
+                    <span style={{ fontSize: 11, color: '#ff9800' }}>{r.message.substring(0, 50)}</span>
                   )}
                   {r.status === 'error' && (
                     <span style={{ fontSize: 11, color: 'var(--danger)' }}>{r.message.substring(0, 40)}</span>
