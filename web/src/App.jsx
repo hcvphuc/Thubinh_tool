@@ -42,6 +42,23 @@ function compressBase64Image(base64, maxSize = 1024, quality = 0.8) {
   });
 }
 
+// ========== HELPER: Fetch with auto-retry on 503/429/500 ==========
+async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const res = await fetch(url, options);
+    if (res.ok) return res;
+    // Retry on server overload errors
+    if ((res.status === 503 || res.status === 429 || res.status === 500) && attempt < maxRetries) {
+      const wait = attempt * 3000; // 3s, 6s, 9s
+      if (logFn) logFn(`⏳ API ${res.status} — retry ${attempt}/${maxRetries} in ${wait / 1000}s...`);
+      await new Promise(r => setTimeout(r, wait));
+      continue;
+    }
+    // Non-retryable error or max retries reached
+    throw new Error(`API: ${res.status}${attempt > 1 ? ` (after ${attempt} tries)` : ''}`);
+  }
+}
+
 // ========== HELPER: Download base64 image ==========
 function downloadBase64(base64Data, mimeType, filename) {
   const link = document.createElement('a');
@@ -330,7 +347,7 @@ function App() {
     addLog('=== REFINE PROMPT ===');
     try {
       setStatus('Gửi Gemini...');
-      const res = await fetch(apiUrl('gemini-2.0-flash'), {
+      const res = await fetchWithRetry(apiUrl('gemini-2.0-flash'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -369,7 +386,7 @@ function App() {
     addLog('=== GENERATE ===');
     try {
       setStatus('Chỉnh sửa ảnh...');
-      const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+      const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -427,7 +444,7 @@ function App() {
         let currentPrompt = prompt;
         if (attempt > 1) currentPrompt += ` URGENT FIX: Previous result had anatomical issues. Correct: ${finalResult?._qcIssues || 'face/body anatomy'}. Verify eye symmetry and skin texture.`;
 
-        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+        const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -505,7 +522,7 @@ function App() {
       // Step 1: AD Analyze (uses compressed subject)
       setStatus('AD 1/3: Phân tích ảnh...');
       addLog('--- STEP 1: AD Analyze ---');
-      const analyzeRes = await fetch(apiUrl('gemini-2.0-flash'), {
+      const analyzeRes = await fetchWithRetry(apiUrl('gemini-2.0-flash'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -548,7 +565,7 @@ function App() {
         parts.push({ inlineData: { mimeType: 'image/jpeg', data: compressedSubject } });
         parts.push({ text: editPrompt });
 
-        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+        const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -572,7 +589,7 @@ function App() {
       setStatus('AD 3/3: QC kiểm tra...');
       addLog('--- STEP 3: QC ---');
       const compResult = await compressBase64Image(result.data, 768, 0.7);
-      const qcRes = await fetch(apiUrl('gemini-2.0-flash'), {
+      const qcRes = await fetchWithRetry(apiUrl('gemini-2.0-flash'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -632,7 +649,7 @@ function App() {
     addLog('=== UPSCALE 4K ===');
     try {
       setStatus('Đang upscale lên 4K...');
-      const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+      const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -686,7 +703,7 @@ function App() {
         let prompt = basePrompt;
         if (attempt > 1) prompt += ` URGENT FIX: Previous result had anatomical issues: ${finalResult?._qcIssues || 'face anatomy error'}. Correct eye symmetry, skin texture, and facial proportions.`;
 
-        const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+        const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -862,7 +879,7 @@ function App() {
             }
           }
 
-          const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+          const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody)
@@ -1203,7 +1220,7 @@ function App() {
       }
       parts.push({ text: `Generate a beautiful EMPTY studio preview (NO people, NO faces, NO human figures) for: ${template.prompt}. Show only the background setup, props, lighting, and atmosphere. This is a thumbnail preview of the studio set.` });
 
-      const res = await fetch(apiUrl('gemini-3-pro-image-preview'), {
+      const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1637,7 +1654,7 @@ function App() {
     <div className="app-container">
       {/* Header */}
       <header className="app-header">
-        <h1><span>🎨</span> ThuBinh AI Studio</h1>
+        <h1><span>📷</span> Thu Bình Camera <span style={{ fontSize: 13, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 8 }}>📞 0914003345</span></h1>
         <div className="api-key-bar">
           {keyValid !== null && <span className={`key-status ${keyValid ? 'valid' : 'invalid'}`}></span>}
           <input

@@ -58,24 +58,32 @@ export async function validateFaceAnatomy(originalB64, resultB64, apiKey) {
 Pass = BOTH scores >= 8.`;
 
     try {
-        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [
-                        { text: "ORIGINAL:" },
-                        { inlineData: { mimeType: 'image/jpeg', data: compOriginal } },
-                        { text: "RESULT:" },
-                        { inlineData: { mimeType: 'image/jpeg', data: compResult } },
-                        { text: prompt }
-                    ]
-                }],
-                generationConfig: { responseMimeType: "application/json" }
-            })
-        });
+        let res = null;
+        for (let retry = 1; retry <= 3; retry++) {
+            res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    contents: [{
+                        parts: [
+                            { text: "ORIGINAL:" },
+                            { inlineData: { mimeType: 'image/jpeg', data: compOriginal } },
+                            { text: "RESULT:" },
+                            { inlineData: { mimeType: 'image/jpeg', data: compResult } },
+                            { text: prompt }
+                        ]
+                    }],
+                    generationConfig: { responseMimeType: "application/json" }
+                })
+            });
+            if (res.ok) break;
+            if ((res.status === 503 || res.status === 429) && retry < 3) {
+                await new Promise(r => setTimeout(r, retry * 2000));
+                continue;
+            }
+        }
 
-        if (!res.ok) return { pass: true, score: 0, issues: 'API Fail' };
+        if (!res || !res.ok) return { pass: true, score: 0, issues: 'API Fail' };
 
         const data = await res.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
