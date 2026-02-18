@@ -417,6 +417,11 @@ function App() {
       if (compositePrompt) prompt += ' ' + compositePrompt;
 
       let finalResult = null;
+      // Pre-compress images for faster API
+      const compBg = await compressBase64Image(bgImage, 1536, 0.85);
+      const compSubject = await compressBase64Image(subjectImage, 1536, 0.85);
+      addLog(`Compressed: BG=${(compBg.length / 1024).toFixed(0)}KB Subject=${(compSubject.length / 1024).toFixed(0)}KB`);
+
       for (let attempt = 1; attempt <= 2; attempt++) {
         setStatus(attempt === 1 ? 'Ghép nền với AI...' : 'Đang sửa lỗi giải phẫu...');
         let currentPrompt = prompt;
@@ -429,9 +434,9 @@ function App() {
             contents: [{
               parts: [
                 { text: 'BACKGROUND IMAGE:' },
-                { inlineData: { mimeType: 'image/jpeg', data: bgImage } },
+                { inlineData: { mimeType: 'image/jpeg', data: compBg } },
                 { text: 'SUBJECT TO COMPOSITE:' },
-                { inlineData: { mimeType: 'image/jpeg', data: subjectImage } },
+                { inlineData: { mimeType: 'image/jpeg', data: compSubject } },
                 { text: 'INSTRUCTION: ' + currentPrompt }
               ]
             }],
@@ -490,7 +495,14 @@ function App() {
       if (!template) throw new Error('Template không tìm thấy');
       addLog('Template: ' + template.name);
 
-      // Step 1: AD Analyze
+      // Pre-compress ALL images first (reused across all 3 steps)
+      const refImages = template.refImages || [];
+      const hasRefs = refImages.length > 0;
+      const compressedRefs = hasRefs ? await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75))) : [];
+      const compressedSubject = await compressBase64Image(templateSubjectImage, 1536, 0.85);
+      addLog(`Compressed: subject=${(compressedSubject.length / 1024).toFixed(0)}KB, refs=${compressedRefs.length}`);
+
+      // Step 1: AD Analyze (uses compressed subject)
       setStatus('AD 1/3: Phân tích ảnh...');
       addLog('--- STEP 1: AD Analyze ---');
       const analyzeRes = await fetch(apiUrl('gemini-2.0-flash'), {
@@ -499,8 +511,8 @@ function App() {
         body: JSON.stringify({
           contents: [{
             parts: [
-              { inlineData: { mimeType: 'image/jpeg', data: templateSubjectImage } },
-              { text: 'Analyze this photo briefly. Respond in JSON only (no markdown):\n{"num_people":number,"pose":"standing/sitting/etc","lighting":"direction and temperature","dof":"shallow/medium/deep and approximate f-stop","focal_length":"estimated mm","camera_distance":"close/medium/far"}' }
+              { inlineData: { mimeType: 'image/jpeg', data: compressedSubject } },
+              { text: 'Analyze briefly. JSON only:\n{"num_people":number,"pose":"standing/sitting","lighting":"direction and temp","dof":"shallow/medium/deep","focal_length":"mm","camera_distance":"close/medium/far"}' }
             ]
           }]
         })
@@ -514,15 +526,7 @@ function App() {
       addCost('textInput', 300);
 
       // Step 2: Background Replacement
-      // Get reference images for this template (if any)
-      const refImages = template.refImages || [];
-      const hasRefs = refImages.length > 0;
       addLog(hasRefs ? `Using ${refImages.length} reference image(s)` : 'No reference images, using text prompt only');
-
-      // Pre-compress images for faster API upload
-      const compressedRefs = hasRefs ? await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75))) : [];
-      const compressedSubject = await compressBase64Image(templateSubjectImage, 1536, 0.85);
-      addLog(`Compressed: subject=${(compressedSubject.length / 1024).toFixed(0)}KB, refs=${compressedRefs.length}`);
 
       const doReplace = async (attempt, qcFix) => {
         setStatus(`AD ${attempt === 1 ? '2/3' : '2R/3'}: Thay background...`);
@@ -564,9 +568,10 @@ function App() {
 
       let result = await doReplace(1, null);
 
-      // Step 3: AD QC
+      // Step 3: AD QC (use compressed images for speed)
       setStatus('AD 3/3: QC kiểm tra...');
       addLog('--- STEP 3: QC ---');
+      const compResult = await compressBase64Image(result.data, 768, 0.7);
       const qcRes = await fetch(apiUrl('gemini-2.0-flash'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -574,10 +579,10 @@ function App() {
           contents: [{
             parts: [
               { text: 'ORIGINAL:' },
-              { inlineData: { mimeType: 'image/jpeg', data: templateSubjectImage } },
+              { inlineData: { mimeType: 'image/jpeg', data: compressedSubject } },
               { text: 'RESULT:' },
-              { inlineData: { mimeType: result.mimeType || 'image/png', data: result.data } },
-              { text: 'QC Director: Compare. JSON only:\n{"face_match":1-10,"pose_match":1-10,"dof_consistency":1-10,"lighting_match":1-10,"realism":1-10,"overall":1-10,"pass":true/false(>=7),"issues":"what to fix"}' }
+              { inlineData: { mimeType: 'image/jpeg', data: compResult } },
+              { text: 'QC: Compare. JSON only:\n{"face_match":1-10,"pose_match":1-10,"dof_consistency":1-10,"lighting_match":1-10,"realism":1-10,"overall":1-10,"pass":true/false(>=7),"issues":"what to fix"}' }
             ]
           }]
         })
@@ -670,6 +675,11 @@ function App() {
     try {
       const basePrompt = `You are a professional face replacement AI. Replace the face in the TARGET IMAGE with the face from the REFERENCE IMAGE. CRITICAL: 1. Face must be EXACTLY identical to REFERENCE. 2. Keep pose, body from TARGET. 3. Match lighting naturally. 4. Result must look completely natural. IMAGE 1 = REFERENCE FACE. IMAGE 2 = TARGET.`;
 
+      // Pre-compress for faster API
+      const compRef = await compressBase64Image(faceRefImage, 1536, 0.85);
+      const compTarget = await compressBase64Image(faceTargetImage, 1536, 0.85);
+      addLog(`Compressed: Ref=${(compRef.length / 1024).toFixed(0)}KB Target=${(compTarget.length / 1024).toFixed(0)}KB`);
+
       let finalResult = null;
       for (let attempt = 1; attempt <= 2; attempt++) {
         setStatus(attempt === 1 ? 'Đang thay thế khuôn mặt...' : 'Đang sửa lỗi giải phẫu...');
@@ -683,8 +693,8 @@ function App() {
             contents: [{
               parts: [
                 { text: prompt },
-                { inlineData: { mimeType: 'image/jpeg', data: faceRefImage } },
-                { inlineData: { mimeType: 'image/jpeg', data: faceTargetImage } }
+                { inlineData: { mimeType: 'image/jpeg', data: compRef } },
+                { inlineData: { mimeType: 'image/jpeg', data: compTarget } }
               ]
             }],
             generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } }
@@ -761,6 +771,21 @@ function App() {
 
     const results = [];
 
+    // Pre-compress batch background (once, outside the loop)
+    const compBatchBg = batchMode === 'composite' ? await compressBase64Image(batchBgImage, 1536, 0.85) : null;
+    // Pre-compress batch template refs (once, outside the loop)
+    let compBatchRefs = [];
+    if (batchMode === 'template') {
+      const template = allTemplates.find(t => t.id === batchSelectedTemplate);
+      if (template) {
+        let refImages = [...(template.refImages || [])];
+        if (template.thumbnail) refImages = [template.thumbnail, ...refImages];
+        refImages = [...new Set(refImages)];
+        compBatchRefs = await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75)));
+      }
+    }
+    addLog(`Pre-compressed: bg=${compBatchBg ? (compBatchBg.length / 1024).toFixed(0) + 'KB' : 'N/A'}, refs=${compBatchRefs.length}`);
+
     for (let i = 0; i < batchFiles.length; i++) {
       const file = batchFiles[i];
       const baseName = file.name.replace(/\.[^/.]+$/, '');
@@ -770,6 +795,7 @@ function App() {
 
       try {
         const subjectB64 = await readFileAsBase64(file);
+        const compSubject = await compressBase64Image(subjectB64, 1536, 0.85);
         let requestBody;
 
         if (batchMode === 'composite') {
@@ -784,9 +810,9 @@ function App() {
             contents: [{
               parts: [
                 { text: 'BACKGROUND IMAGE:' },
-                { inlineData: { mimeType: 'image/jpeg', data: batchBgImage } },
+                { inlineData: { mimeType: 'image/jpeg', data: compBatchBg } },
                 { text: 'SUBJECT TO COMPOSITE:' },
-                { inlineData: { mimeType: 'image/jpeg', data: subjectB64 } },
+                { inlineData: { mimeType: 'image/jpeg', data: compSubject } },
                 { text: 'INSTRUCTION: ' + prompt }
               ]
             }],
@@ -796,30 +822,20 @@ function App() {
           const template = allTemplates.find(t => t.id === batchSelectedTemplate);
           if (!template) throw new Error('Template không tìm thấy');
 
-          // Collect ref images: template refs + THUMBNAIL (if any)
-          let refImages = [...(template.refImages || [])];
-          if (template.thumbnail) {
-            // Add thumbnail as the FIRST reference (highest priority)
-            refImages = [template.thumbnail, ...refImages];
-          }
+          const hasRefs = compBatchRefs.length > 0;
 
-          // Deduplicate refs
-          refImages = [...new Set(refImages)];
-          const hasRefs = refImages.length > 0;
-
-          let tplPrompt = `Generate a background based on: ${template.prompt}. Then composite the subject onto it. CRITICAL: Keep all faces, poses exactly the same. Match lighting. Photorealistic. 4K.`;
-          if (hasRefs) tplPrompt += ' REFERENCE IMAGES provided (including thumbnail preview). Match the reference studio style exactly.';
+          let tplPrompt = `Generate a background based on: ${template.prompt}. Composite the subject onto it. Keep all faces, poses exactly same. Match lighting. Photorealistic. 4K.`;
+          if (hasRefs) tplPrompt += ' Match REFERENCE IMAGES style exactly.';
 
           const parts = [];
-          // Add refs
           if (hasRefs) {
-            parts.push({ text: 'REFERENCE STUDIO IMAGES (replicate style):' });
-            refImages.forEach(img => {
+            parts.push({ text: 'REFERENCE STUDIO IMAGES:' });
+            compBatchRefs.forEach(img => {
               parts.push({ inlineData: { mimeType: 'image/jpeg', data: img } });
             });
           }
           parts.push({ text: 'SUBJECT(S) TO COMPOSITE:' });
-          parts.push({ inlineData: { mimeType: 'image/jpeg', data: subjectB64 } });
+          parts.push({ inlineData: { mimeType: 'image/jpeg', data: compSubject } });
           parts.push({ text: 'INSTRUCTION: ' + tplPrompt });
 
           requestBody = {

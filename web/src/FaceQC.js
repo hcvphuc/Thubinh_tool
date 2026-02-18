@@ -1,6 +1,7 @@
 /**
  * FaceQC.js - AI-Powered Face Anatomy Validation
  * Uses Gemini 2.0 Flash for rapid anatomical & identity verification.
+ * Images are compressed to 768px before API call for speed.
  */
 
 // Helper to extract JSON from response
@@ -14,6 +15,28 @@ function extractJson(text) {
     }
 }
 
+// Compress base64 image for QC (don't need full res for face analysis)
+function compressForQC(base64, maxSize = 768) {
+    return new Promise((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+            let { width, height } = img;
+            if (width > maxSize || height > maxSize) {
+                const ratio = Math.min(maxSize / width, maxSize / height);
+                width = Math.round(width * ratio);
+                height = Math.round(height * ratio);
+            }
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+            resolve(canvas.toDataURL('image/jpeg', 0.7).split(',')[1]);
+        };
+        img.onerror = () => resolve(base64);
+        img.src = `data:image/jpeg;base64,${base64}`;
+    });
+}
+
 /**
  * Validate Anatomical Structure & Identity
  * @param {string} originalB64 - Original face image
@@ -24,30 +47,15 @@ function extractJson(text) {
 export async function validateFaceAnatomy(originalB64, resultB64, apiKey) {
     if (!apiKey) return { pass: true, score: 0, issues: 'No API Key' };
 
-    const prompt = `
-    ROLE: Master Anatomist & Forensic Image Analyst.
-    TASK: Compare the RESULT image against the ORIGINAL source image.
-    
-    STRICT ANATOMICAL CHECKLIST:
-    1. EYE GEOMETRY: Check pupil roundness, iris color, eye shape symmetry. Are eyes wandering (strabismus) if not present in original?
-    2. NOSE & MOUTH: Check philtrum length, lip shape, and nasolabial folds. Is the mouth skewed?
-    3. SKIN TEXTURE: Is it realistic skin with pores/texture, or smooth plastic AI skin?
-    4. SKELETAL STRUCTURE: Does the jawline and cheekbone structure match the original identity perfectly?
-    5. LIMBS/Hands (if visible): Count fingers. Check joint articulation.
-    
-    SCORING (1-10):
-    - 10: Perfect biological realism & identity match.
-    - 8-9: Minor lighting differences, anatomy perfect.
-    - 1-7: Anatomical failure (warped eyes, plastic skin, wrong identity).
+    // Compress images for faster QC (768px is enough for face analysis)
+    const [compOriginal, compResult] = await Promise.all([
+        compressForQC(originalB64, 768),
+        compressForQC(resultB64, 768)
+    ]);
 
-    OUTPUT ONLY JSON:
-    {
-      "anatomy_score": number, // 1-10
-      "identity_score": number, // 1-10
-      "pass": boolean, // true if BOTH scores >= 8
-      "issue": "Brief description of the anatomical fail (e.g. 'Left eye distorted', 'Plastic skin texture')"
-    }
-  `;
+    const prompt = `Compare RESULT vs ORIGINAL. Check: 1) Eye symmetry & pupils 2) Nose/mouth shape 3) Skin texture (real vs plastic) 4) Identity match 5) Limbs/hands if visible. Score 1-10. JSON only:
+{"anatomy_score":number,"identity_score":number,"pass":boolean,"issue":"brief description"}
+Pass = BOTH scores >= 8.`;
 
     try {
         const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`, {
@@ -56,10 +64,10 @@ export async function validateFaceAnatomy(originalB64, resultB64, apiKey) {
             body: JSON.stringify({
                 contents: [{
                     parts: [
-                        { text: "ORIGINAL FACE:" },
-                        { inlineData: { mimeType: 'image/jpeg', data: originalB64 } },
-                        { text: "RESULT IMAGE:" },
-                        { inlineData: { mimeType: 'image/jpeg', data: resultB64 } },
+                        { text: "ORIGINAL:" },
+                        { inlineData: { mimeType: 'image/jpeg', data: compOriginal } },
+                        { text: "RESULT:" },
+                        { inlineData: { mimeType: 'image/jpeg', data: compResult } },
                         { text: prompt }
                     ]
                 }],
@@ -67,7 +75,7 @@ export async function validateFaceAnatomy(originalB64, resultB64, apiKey) {
             })
         });
 
-        if (!res.ok) return { pass: true, score: 0, issues: 'API Fail' }; // Fail open to avoid blocking
+        if (!res.ok) return { pass: true, score: 0, issues: 'API Fail' };
 
         const data = await res.json();
         const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '{}';
