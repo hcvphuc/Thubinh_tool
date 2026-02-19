@@ -77,7 +77,7 @@ Pass = BOTH scores >= 8.`;
                 })
             });
             if (res.ok) break;
-            if ((res.status === 503 || res.status === 429) && retry < 3) {
+            if ([503, 429, 449].includes(res.status) && retry < 3) {
                 await new Promise(r => setTimeout(r, retry * 2000));
                 continue;
             }

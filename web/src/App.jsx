@@ -42,20 +42,34 @@ function compressBase64Image(base64, maxSize = 1024, quality = 0.8) {
   });
 }
 
-// ========== HELPER: Fetch with auto-retry on 503/429/500 ==========
+// ========== HELPER: Fetch with timeout + auto-retry on 503/429/500/449 ==========
 async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    const res = await fetch(url, options);
-    if (res.ok) return res;
-    // Retry on server overload errors
-    if ((res.status === 503 || res.status === 429 || res.status === 500) && attempt < maxRetries) {
-      const wait = attempt * 3000; // 3s, 6s, 9s
-      if (logFn) logFn(`⏳ API ${res.status} — retry ${attempt}/${maxRetries} in ${wait / 1000}s...`);
-      await new Promise(r => setTimeout(r, wait));
-      continue;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000); // 120s timeout
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timeout);
+      if (res.ok) return res;
+      // Retry on server overload errors
+      if ([503, 429, 500, 449].includes(res.status) && attempt < maxRetries) {
+        const wait = attempt * 3000;
+        if (logFn) logFn(`⏳ API ${res.status} — retry ${attempt}/${maxRetries} in ${wait / 1000}s...`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw new Error(`API: ${res.status}${attempt > 1 ? ` (after ${attempt} tries)` : ''}`);
+    } catch (e) {
+      clearTimeout(timeout);
+      if (e.name === 'AbortError') {
+        if (attempt < maxRetries) {
+          if (logFn) logFn(`⏳ Timeout — retry ${attempt}/${maxRetries}...`);
+          continue;
+        }
+        throw new Error('Request timeout (120s) — API quá chậm. Thử lại sau.');
+      }
+      throw e;
     }
-    // Non-retryable error or max retries reached
-    throw new Error(`API: ${res.status}${attempt > 1 ? ` (after ${attempt} tries)` : ''}`);
   }
 }
 
@@ -178,6 +192,7 @@ function App() {
   const [batchOptKeepFace, setBatchOptKeepFace] = useState(true);
   const [batchOptKeepPose, setBatchOptKeepPose] = useState(true);
   const [batchOptMatchLight, setBatchOptMatchLight] = useState(true);
+  const [enableQC, setEnableQC] = useState(false); // QC mặc định TẮT cho nhanh
   const [batchProgress, setBatchProgress] = useState({ current: 0, total: 0, running: false });
   const [batchResults, setBatchResults] = useState([]); // { fileName, status, message, imageData, mimeType }
 
@@ -435,62 +450,57 @@ function App() {
 
       let finalResult = null;
       // Pre-compress images for faster API
+      setStatus('Đang nén ảnh...');
       const compBg = await compressBase64Image(bgImage, 1536, 0.85);
       const compSubject = await compressBase64Image(subjectImage, 1536, 0.85);
       addLog(`Compressed: BG=${(compBg.length / 1024).toFixed(0)}KB Subject=${(compSubject.length / 1024).toFixed(0)}KB`);
 
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        setStatus(attempt === 1 ? 'Ghép nền với AI...' : 'Đang sửa lỗi giải phẫu...');
-        let currentPrompt = prompt;
-        if (attempt > 1) currentPrompt += ` URGENT FIX: Previous result had anatomical issues. Correct: ${finalResult?._qcIssues || 'face/body anatomy'}. Verify eye symmetry and skin texture.`;
-
+      const doGenerate = async (fixPrompt) => {
+        setStatus(fixPrompt ? 'Đang sửa lỗi...' : 'Ghép nền với AI...');
+        const finalPrompt = fixPrompt ? prompt + ' FIX: ' + fixPrompt : prompt;
         const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{
               parts: [
-                { text: 'BACKGROUND IMAGE:' },
+                { text: 'BACKGROUND:' },
                 { inlineData: { mimeType: 'image/jpeg', data: compBg } },
-                { text: 'SUBJECT TO COMPOSITE:' },
+                { text: 'SUBJECT:' },
                 { inlineData: { mimeType: 'image/jpeg', data: compSubject } },
-                { text: 'INSTRUCTION: ' + currentPrompt }
+                { text: finalPrompt }
               ]
             }],
             generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: compositeAspectRatio } }
           })
-        });
-        if (!res.ok) throw new Error('API failed: ' + res.status);
+        }, 3, addLog);
         const data = await res.json();
         const img = extractImage(data);
         if (!img) throw new Error('No image');
         addCost('image', 1);
         addCost('textInput', 2000);
+        return img;
+      };
 
-        // QC Check
+      finalResult = await doGenerate(null);
+
+      // Optional QC
+      if (enableQC) {
         setStatus('Kiểm tra giải phẫu...');
-        addLog(`QC Check (${attempt}/2)...`);
-        const qc = await validateFaceAnatomy(subjectImage, img.data, key.trim());
+        addLog('QC Check...');
+        const qc = await validateFaceAnatomy(compSubject, finalResult.data, key.trim());
         addCost('textInput', 800);
-
         if (qc.pass) {
           addLog(`✓ QC Passed (Score: ${qc.score})`);
-          setResultImage(img);
-          setStatus('Xong! (QC ✅)');
-          addLog('Composite done!');
-          finalResult = img;
-          break;
         } else {
-          addLog(`⚠ QC Fail (${attempt}/2): ${qc.issues}`);
-          finalResult = img;
-          finalResult._qcIssues = qc.issues;
-          if (attempt === 2) {
-            setResultImage(img);
-            setStatus('Xong! (QC ⚠️ Retry)');
-            addLog('Accepting after retry limit.');
-          }
+          addLog(`⚠ QC Fail: ${qc.issues} — Retrying...`);
+          finalResult = await doGenerate(qc.issues);
         }
       }
+
+      setResultImage(finalResult);
+      setStatus('Xong!');
+      addLog('Composite done!');
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -500,68 +510,43 @@ function App() {
     }
   }
 
-  // ========== TEMPLATE (BG REPLACE + AD QC) ==========
+  // ========== TEMPLATE (BG REPLACE) ==========
   async function handleTemplateComposite() {
     if (!templateSubjectImage) { alert('Chưa upload subject!'); return; }
     if (!selectedTemplate) { alert('Chưa chọn template!'); return; }
 
     setLoading(true);
-    addLog('=== TEMPLATE (BG REPLACE + AD QC) ===');
+    addLog('=== TEMPLATE BG REPLACE ===');
     try {
       const template = allTemplates.find(t => t.id === selectedTemplate);
       if (!template) throw new Error('Template không tìm thấy');
       addLog('Template: ' + template.name);
 
-      // Pre-compress ALL images first (reused across all 3 steps)
+      // Pre-compress images
       const refImages = template.refImages || [];
       const hasRefs = refImages.length > 0;
+      setStatus('Đang nén ảnh...');
       const compressedRefs = hasRefs ? await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75))) : [];
       const compressedSubject = await compressBase64Image(templateSubjectImage, 1536, 0.85);
       addLog(`Compressed: subject=${(compressedSubject.length / 1024).toFixed(0)}KB, refs=${compressedRefs.length}`);
 
-      // Step 1: AD Analyze (uses compressed subject)
-      setStatus('AD 1/3: Phân tích ảnh...');
-      addLog('--- STEP 1: AD Analyze ---');
-      const analyzeRes = await fetchWithRetry(apiUrl('gemini-2.0-flash'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { inlineData: { mimeType: 'image/jpeg', data: compressedSubject } },
-              { text: 'Analyze briefly. JSON only:\n{"num_people":number,"pose":"standing/sitting","lighting":"direction and temp","dof":"shallow/medium/deep","focal_length":"mm","camera_distance":"close/medium/far"}' }
-            ]
-          }]
-        })
-      });
-      let adInfo = '{}';
-      if (analyzeRes.ok) {
-        const aData = await analyzeRes.json();
-        adInfo = extractText(aData) || '{}';
-        addLog('AD: ' + adInfo.substring(0, 200));
-      }
-      addCost('textInput', 300);
-
-      // Step 2: Background Replacement
-      addLog(hasRefs ? `Using ${refImages.length} reference image(s)` : 'No reference images, using text prompt only');
-
+      // === SINGLE STEP: Generate background replacement ===
       const doReplace = async (attempt, qcFix) => {
-        setStatus(`AD ${attempt === 1 ? '2/3' : '2R/3'}: Thay background...`);
-        addLog(`--- STEP 2: BG Replace #${attempt} ---`);
+        setStatus(attempt === 1 ? 'Đang thay background...' : 'Đang sửa lỗi...');
+        addLog(`--- BG Replace #${attempt} ---`);
 
-        let editPrompt = `Replace ONLY the background. Keep person(s) 100% unchanged (face, body, pose, clothes). NEW BG: ${template.prompt}. ANALYSIS: ${adInfo}. RULES: Match original DOF/bokeh, camera angle, lighting direction/color temp. Natural ground contact. Photorealistic result.`;
+        let editPrompt = `Replace ONLY the background. Keep person(s) 100% unchanged (face, body, pose, clothes). NEW BG: ${template.prompt}. Match original DOF/bokeh, camera angle, lighting. Natural ground contact. Photorealistic.`;
         if (hasRefs) editPrompt += ' Match REFERENCE IMAGES style exactly.';
         if (qcFix) editPrompt += ' FIX: ' + qcFix;
 
-        // Build parts array with compressed images
         const parts = [];
         if (hasRefs) {
-          parts.push({ text: 'REFERENCE STUDIO IMAGES:' });
+          parts.push({ text: 'REFERENCE IMAGES:' });
           compressedRefs.forEach(refB64 => {
             parts.push({ inlineData: { mimeType: 'image/jpeg', data: refB64 } });
           });
         }
-        parts.push({ text: 'SUBJECT PHOTO (keep unchanged):' });
+        parts.push({ text: 'SUBJECT (keep unchanged):' });
         parts.push({ inlineData: { mimeType: 'image/jpeg', data: compressedSubject } });
         parts.push({ text: editPrompt });
 
@@ -572,8 +557,7 @@ function App() {
             contents: [{ parts }],
             generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K', aspectRatio: templateAspectRatio } }
           })
-        });
-        if (!res.ok) throw new Error('Replace failed: ' + res.status);
+        }, 3, addLog);
         const data = await res.json();
         const img = extractImage(data);
         if (!img) throw new Error('No image returned');
@@ -585,51 +569,22 @@ function App() {
 
       let result = await doReplace(1, null);
 
-      // Step 3: AD QC (use compressed images for speed)
-      setStatus('AD 3/3: QC kiểm tra...');
-      addLog('--- STEP 3: QC ---');
-      const compResult = await compressBase64Image(result.data, 768, 0.7);
-      const qcRes = await fetchWithRetry(apiUrl('gemini-2.0-flash'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{
-            parts: [
-              { text: 'ORIGINAL:' },
-              { inlineData: { mimeType: 'image/jpeg', data: compressedSubject } },
-              { text: 'RESULT:' },
-              { inlineData: { mimeType: 'image/jpeg', data: compResult } },
-              { text: 'QC: Compare. JSON only:\n{"face_match":1-10,"pose_match":1-10,"dof_consistency":1-10,"lighting_match":1-10,"realism":1-10,"overall":1-10,"pass":true/false(>=7),"issues":"what to fix"}' }
-            ]
-          }]
-        })
-      });
-      addCost('textInput', 800);
-      let qcPassed = true;
-      let qcIssues = '';
-      if (qcRes.ok) {
-        const qcData = await qcRes.json();
-        const qcText = extractText(qcData);
-        addLog('QC: ' + qcText.substring(0, 300));
-        try {
-          const cQc = qcText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-          const qc = JSON.parse(cQc);
-          addLog(`Scores: Face=${qc.face_match} Pose=${qc.pose_match} DOF=${qc.dof_consistency} Realism=${qc.realism} Overall=${qc.overall}`);
-          if (qc.pass === false && qc.overall < 7) {
-            qcPassed = false;
-            qcIssues = qc.issues || 'Fix realism and DOF.';
-            addLog('QC FAILED — Retry: ' + qcIssues);
-          } else addLog('QC PASSED!');
-        } catch { addLog('QC parse err, accepting'); }
-      }
-
-      if (!qcPassed) {
-        addLog('=== RETRY ===');
-        result = await doReplace(2, qcIssues);
+      // === OPTIONAL QC ===
+      if (enableQC) {
+        setStatus('QC kiểm tra...');
+        addLog('--- QC Check ---');
+        const qc = await validateFaceAnatomy(compressedSubject, result.data, key.trim());
+        addCost('textInput', 800);
+        if (qc.pass) {
+          addLog(`✓ QC Passed (Score: ${qc.score})`);
+        } else {
+          addLog(`⚠ QC Fail: ${qc.issues} — Retrying...`);
+          result = await doReplace(2, qc.issues);
+        }
       }
 
       setResultImage(result);
-      setStatus(qcPassed ? 'Xong! (QC ✅)' : 'Xong! (Retry)');
+      setStatus('Xong!');
       addLog('DONE!');
     } catch (e) {
       addLog('Error: ' + e.message);
@@ -690,64 +645,58 @@ function App() {
     setLoading(true);
     addLog('=== FACE SWAP ===');
     try {
-      const basePrompt = `You are a professional face replacement AI. Replace the face in the TARGET IMAGE with the face from the REFERENCE IMAGE. CRITICAL: 1. Face must be EXACTLY identical to REFERENCE. 2. Keep pose, body from TARGET. 3. Match lighting naturally. 4. Result must look completely natural. IMAGE 1 = REFERENCE FACE. IMAGE 2 = TARGET.`;
+      const basePrompt = `Replace the face in TARGET with REFERENCE face. Keep pose/body from TARGET. Match lighting. Natural result. IMAGE 1 = REFERENCE FACE. IMAGE 2 = TARGET.`;
 
-      // Pre-compress for faster API
+      // Pre-compress
+      setStatus('Đang nén ảnh...');
       const compRef = await compressBase64Image(faceRefImage, 1536, 0.85);
       const compTarget = await compressBase64Image(faceTargetImage, 1536, 0.85);
       addLog(`Compressed: Ref=${(compRef.length / 1024).toFixed(0)}KB Target=${(compTarget.length / 1024).toFixed(0)}KB`);
 
-      let finalResult = null;
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        setStatus(attempt === 1 ? 'Đang thay thế khuôn mặt...' : 'Đang sửa lỗi giải phẫu...');
-        let prompt = basePrompt;
-        if (attempt > 1) prompt += ` URGENT FIX: Previous result had anatomical issues: ${finalResult?._qcIssues || 'face anatomy error'}. Correct eye symmetry, skin texture, and facial proportions.`;
-
+      const doSwap = async (fixPrompt) => {
+        setStatus(fixPrompt ? 'Đang sửa lỗi...' : 'Đang thay thế khuôn mặt...');
+        const finalPrompt = fixPrompt ? basePrompt + ' FIX: ' + fixPrompt : basePrompt;
         const res = await fetchWithRetry(apiUrl('gemini-3-pro-image-preview'), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             contents: [{
               parts: [
-                { text: prompt },
+                { text: finalPrompt },
                 { inlineData: { mimeType: 'image/jpeg', data: compRef } },
                 { inlineData: { mimeType: 'image/jpeg', data: compTarget } }
               ]
             }],
             generationConfig: { responseModalities: ['TEXT', 'IMAGE'], imageConfig: { imageSize: '4K' } }
           })
-        });
-        if (!res.ok) throw new Error('API failed: ' + res.status);
+        }, 3, addLog);
         const data = await res.json();
         const img = extractImage(data);
         if (!img) throw new Error('No image');
         addCost('image', 1);
         addCost('textInput', 2000);
+        return img;
+      };
 
-        // QC Check - compare result face with reference face
+      let result = await doSwap(null);
+
+      // Optional QC
+      if (enableQC) {
         setStatus('Kiểm tra giải phẫu...');
-        addLog(`QC Check (${attempt}/2)...`);
-        const qc = await validateFaceAnatomy(faceRefImage, img.data, key.trim());
+        addLog('QC Check...');
+        const qc = await validateFaceAnatomy(compRef, result.data, key.trim());
         addCost('textInput', 800);
-
         if (qc.pass) {
           addLog(`✓ QC Passed (Score: ${qc.score})`);
-          setResultImage(img);
-          setStatus('Face swap xong! (QC ✅)');
-          addLog('Face swapped!');
-          finalResult = img;
-          break;
         } else {
-          addLog(`⚠ QC Fail (${attempt}/2): ${qc.issues}`);
-          finalResult = img;
-          finalResult._qcIssues = qc.issues;
-          if (attempt === 2) {
-            setResultImage(img);
-            setStatus('Face swap xong! (QC ⚠️)');
-            addLog('Accepting after retry limit.');
-          }
+          addLog(`⚠ QC Fail: ${qc.issues} — Retrying...`);
+          result = await doSwap(qc.issues);
         }
       }
+
+      setResultImage(result);
+      setStatus('Xong!');
+      addLog('Face swapped!');
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -868,14 +817,14 @@ function App() {
         let finalImg = null;
         let success = false;
 
-        for (let attempt = 1; attempt <= 2; attempt++) {
+        const maxAttempts = enableQC ? 2 : 1;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
           if (attempt > 1) {
             addLog(`⟳ Retry #${attempt} fixing: ${qcIssues}`);
-            // Append fix instruction to the last text part of prompt
             const parts = requestBody.contents[0].parts;
             const lastTextPart = parts[parts.length - 1];
             if (lastTextPart && lastTextPart.text) {
-              lastTextPart.text += ` URGENT FIX: The previous result had anatomical errors: ${qcIssues}. Correct the face/body anatomy completely. Verify eye symmetry and skin texture.`;
+              lastTextPart.text += ` FIX: ${qcIssues}`;
             }
           }
 
@@ -883,30 +832,33 @@ function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(requestBody)
-          });
-
-          if (!res.ok) throw new Error('API: ' + res.status);
+          }, 3, addLog);
           const data = await res.json();
           const img = extractImage(data);
 
           if (!img) break;
 
-          // QC Check
-          addLog(`Analyzing Anatomy (${attempt}/2)...`);
-          const qc = await validateFaceAnatomy(subjectB64, img.data, key.trim());
-
-          if (qc.pass) {
+          // QC Check (only if enabled)
+          if (enableQC) {
+            addLog(`QC Check (${attempt}/${maxAttempts})...`);
+            const qc = await validateFaceAnatomy(compSubject, img.data, key.trim());
+            if (qc.pass) {
+              finalImg = img;
+              success = true;
+              addLog(`✓ QC Passed (Score: ${qc.score})`);
+              break;
+            } else {
+              addLog(`⚠ QC Fail: ${qc.issues}`);
+              qcIssues = qc.issues;
+              if (attempt === maxAttempts) {
+                finalImg = img;
+                addLog('⚠ Accepting after retry limit.');
+              }
+            }
+          } else {
             finalImg = img;
             success = true;
-            addLog(`✓ QC Passed (Score: ${qc.score})`);
             break;
-          } else {
-            addLog(`⚠ QC Fail: ${qc.issues}`);
-            qcIssues = qc.issues;
-            if (attempt === 2) {
-              finalImg = img; // Accept result after max retries
-              addLog('⚠ Accepting result after retry limit.');
-            }
           }
         }
 
@@ -1599,6 +1551,13 @@ function App() {
         <div className="card" style={{ marginBottom: 16 }}>
           <div className="card-title"><span>📐</span> Tỉ lệ</div>
           <RatioSelector value={batchAspectRatio} onChange={setBatchAspectRatio} />
+        </div>
+
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div className="toggle-item" onClick={() => setEnableQC(!enableQC)}>
+            <div className={`toggle-switch ${enableQC ? 'active' : ''}`}></div>
+            <span className="toggle-label">🔍 QC kiểm tra giải phẫu {enableQC ? '(Chậm hơn 2-3x)' : '(TẮT — Nhanh)'}</span>
+          </div>
         </div>
 
         <button className="btn btn-primary btn-lg" onClick={handleBatchProcess} disabled={loading || batchFiles.length === 0} style={{ width: '100%', marginBottom: 16 }}>
