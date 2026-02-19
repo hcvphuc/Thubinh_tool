@@ -264,7 +264,7 @@ function App() {
     }
   }, []);
 
-  // ========== Load template data from cloud (primary) + IndexedDB (fallback) ==========
+  // ========== Load template data from cloud (primary) + IndexedDB (fallback + auto-migrate) ==========
   useEffect(() => {
     (async () => {
       try {
@@ -273,13 +273,13 @@ function App() {
         if (cloudData && Object.keys(cloudData).length > 0) {
           setTemplateData(cloudData);
           console.log(`☁️ Loaded ${Object.keys(cloudData).length} templates from cloud`);
-          return; // Cloud data loaded, skip IndexedDB
+          return; // Cloud has data, done
         }
       } catch (e) {
         console.warn('Cloud load error:', e);
       }
 
-      // 2. Fallback to IndexedDB
+      // 2. Cloud empty → load from IndexedDB
       try {
         const data = await getAllTemplateData();
         const oldRefs = await migrateOldRefs();
@@ -293,7 +293,31 @@ function App() {
           }
         }
         setTemplateData(data);
-        if (Object.keys(data).length > 0) console.log(`📦 Loaded ${Object.keys(data).length} templates from IndexedDB`);
+        const count = Object.keys(data).length;
+        if (count > 0) {
+          console.log(`📦 Loaded ${count} templates from IndexedDB`);
+          // 3. Auto-migrate to cloud!
+          console.log('☁️ Migrating templates to cloud...');
+          for (const [id, d] of Object.entries(data)) {
+            // Upload thumbnail
+            if (d.thumbnail) {
+              try {
+                await supa.saveTemplateThumbnail(id, d.thumbnail);
+                console.log(`☁️ Thumb ${id}: OK`);
+              } catch (e) { console.warn(`Thumb ${id}: FAIL`, e); }
+            }
+            // Upload ref images
+            if (d.refImages && d.refImages.length > 0) {
+              try {
+                await supa.saveTemplateRefImages(id, d.refImages);
+                console.log(`☁️ Refs ${id}: OK (${d.refImages.length})`);
+              } catch (e) { console.warn(`Refs ${id}: FAIL`, e); }
+            }
+          }
+          // Upload config
+          await supa.saveTemplateConfig(data);
+          console.log('☁️ Migration complete!');
+        }
       } catch (err) {
         console.warn('IndexedDB load error:', err);
       }
