@@ -44,17 +44,18 @@ function compressBase64Image(base64, maxSize = 1024, quality = 0.8) {
 }
 
 // ========== HELPER: Fetch with timeout + auto-retry on 503/429/500/449 ==========
-async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
+async function fetchWithRetry(url, options, maxRetries = 5, logFn = null) {
+  const RETRY_DELAYS = [5000, 15000, 30000, 60000, 60000]; // exponential backoff
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000); // 120s timeout
+    const timeout = setTimeout(() => controller.abort(), 180000); // 180s timeout
     try {
       const res = await fetch(url, { ...options, signal: controller.signal });
       clearTimeout(timeout);
       if (res.ok) return res;
       // Retry on server overload errors
       if ([503, 429, 500, 449].includes(res.status) && attempt < maxRetries) {
-        const wait = attempt * 3000;
+        const wait = RETRY_DELAYS[attempt - 1] || 60000;
         if (logFn) logFn(`⏳ API ${res.status} — retry ${attempt}/${maxRetries} in ${wait / 1000}s...`);
         await new Promise(r => setTimeout(r, wait));
         continue;
@@ -67,7 +68,7 @@ async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
           if (logFn) logFn(`⏳ Timeout — retry ${attempt}/${maxRetries}...`);
           continue;
         }
-        throw new Error('Request timeout (120s) — API quá chậm. Thử lại sau.');
+        throw new Error('Request timeout (180s) — API quá chậm. Thử lại sau.');
       }
       throw e;
     }
