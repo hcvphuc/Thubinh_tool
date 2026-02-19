@@ -1,334 +1,255 @@
 // ========== Supabase Storage Helper (REST API only, no SDK needed) ==========
 
 const BUCKET = 'photos';
-const MAX_STORAGE_MB = 900; // Auto-cleanup when exceeding this
+const MAX_STORAGE_MB = 900;
 
 // Hardcoded Supabase config (anon key is safe for frontend - secured by RLS)
 const SUPABASE_URL = 'https://grmofxaelrangzcbfifb.supabase.co';
 const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdybW9meGFlbHJhbmd6Y2JmaWZiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NzExNzMsImV4cCI6MjA4NzA0NzE3M30.tU8MBJLsMrNQNAHQePG_-wY-3DGZShmdraOoJsUUEZA';
 
-function getConfig() {
-    return { url: SUPABASE_URL, key: SUPABASE_KEY };
-}
+function getConfig() { return { url: SUPABASE_URL, key: SUPABASE_KEY }; }
+function saveConfig() { /* no-op */ }
+function isConfigured() { return true; }
 
-function saveConfig() { /* no-op, hardcoded */ }
-
-function isConfigured() {
-    return true;
-}
-
-// ========== Storage API calls ==========
+// ========== Core Storage ==========
 
 async function storageHeaders() {
     const { key } = getConfig();
-    return {
-        'Authorization': `Bearer ${key}`,
-        'apikey': key,
-    };
+    return { 'Authorization': `Bearer ${key}`, 'apikey': key };
 }
 
 function storageUrl(path) {
-    const { url } = getConfig();
-    return `${url}/storage/v1${path}`;
+    return `${SUPABASE_URL}/storage/v1${path}`;
 }
 
-// Upload a base64 JPEG image to Supabase Storage
+function getPublicUrl(filename) {
+    return `${SUPABASE_URL}/storage/v1/object/public/${BUCKET}/${filename}`;
+}
+
+// Helper: base64 to blob
+function base64ToBlob(b64, type = 'image/jpeg') {
+    const bc = atob(b64);
+    const ba = new Uint8Array(bc.length);
+    for (let i = 0; i < bc.length; i++) ba[i] = bc.charCodeAt(i);
+    return new Blob([ba], { type });
+}
+
+// Helper: upload blob (upsert)
+async function uploadBlob(path, blob, contentType) {
+    const headers = await storageHeaders();
+    headers['Content-Type'] = contentType;
+    let res = await fetch(storageUrl(`/object/${BUCKET}/${path}`), { method: 'PUT', headers, body: blob });
+    if (!res.ok) res = await fetch(storageUrl(`/object/${BUCKET}/${path}`), { method: 'POST', headers, body: blob });
+    return res.ok;
+}
+
+// Upload base64 JPEG image
 async function uploadImage(base64Data, filename) {
-    if (!isConfigured()) return { error: 'Supabase chưa cấu hình' };
-
     try {
-        // Convert base64 to Blob
-        const byteChars = atob(base64Data);
-        const byteArray = new Uint8Array(byteChars.length);
-        for (let i = 0; i < byteChars.length; i++) {
-            byteArray[i] = byteChars.charCodeAt(i);
-        }
-        const blob = new Blob([byteArray], { type: 'image/jpeg' });
-
-        const headers = await storageHeaders();
-        headers['Content-Type'] = 'image/jpeg';
-
-        const res = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
-            method: 'POST',
-            headers,
-            body: blob,
-        });
-
-        if (res.status === 400) {
-            // File exists, try upsert
-            const res2 = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
-                method: 'PUT',
-                headers,
-                body: blob,
-            });
-            if (!res2.ok) return { error: `Upload failed: ${res2.status}` };
-            return { success: true, filename, size: blob.size };
-        }
-
-        if (!res.ok) return { error: `Upload failed: ${res.status}` };
-        return { success: true, filename, size: blob.size };
-    } catch (e) {
-        return { error: e.message };
-    }
+        const blob = base64ToBlob(base64Data);
+        const ok = await uploadBlob(filename, blob, 'image/jpeg');
+        return ok ? { success: true, filename, size: blob.size } : { error: 'Upload failed' };
+    } catch (e) { return { error: e.message }; }
 }
 
-// List all files in bucket
+// List files in bucket
 async function listFiles(sortBy = 'created_at', order = 'asc') {
-    if (!isConfigured()) return [];
-
     try {
         const headers = await storageHeaders();
         headers['Content-Type'] = 'application/json';
-
         const res = await fetch(storageUrl(`/object/list/${BUCKET}`), {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({
-                prefix: '',
-                limit: 1000,
-                offset: 0,
-                sortBy: { column: sortBy, order },
-            }),
+            method: 'POST', headers,
+            body: JSON.stringify({ prefix: '', limit: 1000, offset: 0, sortBy: { column: sortBy, order } }),
         });
-
         if (!res.ok) return [];
         const files = await res.json();
-        // Filter out folder placeholders
         return files.filter(f => f.name && !f.name.endsWith('/'));
-    } catch {
-        return [];
-    }
+    } catch { return []; }
 }
 
-// Delete a file
+// Delete file(s)
 async function deleteFile(filename) {
-    if (!isConfigured()) return false;
-
     try {
         const headers = await storageHeaders();
         headers['Content-Type'] = 'application/json';
-
         const res = await fetch(storageUrl(`/object/${BUCKET}`), {
-            method: 'DELETE',
-            headers,
-            body: JSON.stringify({ prefixes: [filename] }),
+            method: 'DELETE', headers, body: JSON.stringify({ prefixes: [filename] }),
         });
-
         return res.ok;
-    } catch {
-        return false;
-    }
+    } catch { return false; }
 }
 
-// Delete multiple files
 async function deleteFiles(filenames) {
-    if (!isConfigured() || filenames.length === 0) return false;
-
+    if (filenames.length === 0) return false;
     try {
         const headers = await storageHeaders();
         headers['Content-Type'] = 'application/json';
-
         const res = await fetch(storageUrl(`/object/${BUCKET}`), {
-            method: 'DELETE',
-            headers,
-            body: JSON.stringify({ prefixes: filenames }),
+            method: 'DELETE', headers, body: JSON.stringify({ prefixes: filenames }),
         });
-
         return res.ok;
-    } catch {
-        return false;
-    }
+    } catch { return false; }
 }
 
-// Get public URL for a file
-function getPublicUrl(filename) {
-    const { url } = getConfig();
-    return `${url}/storage/v1/object/public/${BUCKET}/${filename}`;
-}
-
-// Get total storage used (in MB)
+// Storage usage
 async function getStorageUsed() {
     const files = await listFiles();
     const totalBytes = files.reduce((sum, f) => sum + (f.metadata?.size || 0), 0);
-    return {
-        totalMB: totalBytes / (1024 * 1024),
-        totalFiles: files.length,
-        files,
-    };
+    return { totalMB: totalBytes / (1024 * 1024), totalFiles: files.length, files };
 }
 
-// Auto-cleanup: delete oldest files until under limit
+// Auto-cleanup oldest files
 async function autoCleanup(logFn = null) {
     const { totalMB, files } = await getStorageUsed();
-
     if (totalMB < MAX_STORAGE_MB) {
         if (logFn) logFn(`Storage: ${totalMB.toFixed(1)}MB / ${MAX_STORAGE_MB}MB — OK`);
         return 0;
     }
-
-    if (logFn) logFn(`⚠ Storage ${totalMB.toFixed(1)}MB > ${MAX_STORAGE_MB}MB — Cleaning up...`);
-
-    // Sort by created_at ascending (oldest first)
-    const sorted = files.sort((a, b) =>
+    if (logFn) logFn(`⚠ Storage ${totalMB.toFixed(1)}MB > ${MAX_STORAGE_MB}MB — Cleaning...`);
+    // Only delete photo files, not template config
+    const deletable = files.filter(f => !f.name.startsWith('_templates/')).sort((a, b) =>
         new Date(a.created_at || 0) - new Date(b.created_at || 0)
     );
-
     let currentMB = totalMB;
     const toDelete = [];
-
-    for (const file of sorted) {
-        if (currentMB < MAX_STORAGE_MB * 0.8) break; // Target 80% of limit
+    for (const file of deletable) {
+        if (currentMB < MAX_STORAGE_MB * 0.8) break;
         toDelete.push(file.name);
         currentMB -= (file.metadata?.size || 0) / (1024 * 1024);
     }
-
     if (toDelete.length > 0) {
         await deleteFiles(toDelete);
-        if (logFn) logFn(`🗑 Deleted ${toDelete.length} old files. Now ~${currentMB.toFixed(1)}MB`);
+        if (logFn) logFn(`🗑 Deleted ${toDelete.length} old photos. Now ~${currentMB.toFixed(1)}MB`);
     }
-
     return toDelete.length;
 }
 
 // Upload with auto-cleanup
 async function uploadWithCleanup(base64Data, filename, logFn = null) {
-    // Check and cleanup before upload
     await autoCleanup(logFn);
-
-    // Upload
     const result = await uploadImage(base64Data, filename);
-    if (result.success && logFn) {
-        logFn(`☁️ Uploaded: ${filename} (${(result.size / 1024).toFixed(0)}KB)`);
-    }
-    if (result.error && logFn) {
-        logFn(`☁️ Upload failed: ${result.error}`);
-    }
+    if (result.success && logFn) logFn(`☁️ Uploaded: ${filename} (${(result.size / 1024).toFixed(0)}KB)`);
+    if (result.error && logFn) logFn(`☁️ Upload failed: ${result.error}`);
     return result;
 }
 
 // Test connection
 async function testConnection() {
-    if (!isConfigured()) return { ok: false, error: 'Chưa cấu hình' };
-
     try {
         const headers = await storageHeaders();
         headers['Content-Type'] = 'application/json';
-
-        // Try listing bucket
         const res = await fetch(storageUrl(`/object/list/${BUCKET}`), {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ prefix: '', limit: 1 }),
+            method: 'POST', headers, body: JSON.stringify({ prefix: '', limit: 1 }),
         });
-
         if (res.ok) return { ok: true };
-        if (res.status === 404) return { ok: false, error: `Bucket "${BUCKET}" chưa tạo. Vào Supabase Dashboard > Storage > New Bucket > tên: photos` };
-        if (res.status === 401) return { ok: false, error: 'API Key sai' };
+        if (res.status === 404) return { ok: false, error: `Bucket "${BUCKET}" chưa tạo` };
         return { ok: false, error: `Error: ${res.status}` };
-    } catch (e) {
-        return { ok: false, error: e.message };
-    }
+    } catch (e) { return { ok: false, error: e.message }; }
 }
 
-// ========== Template Data Sync ==========
-const TEMPLATE_DATA_FILE = '_config/templates.json';
+// ========== Template Cloud Storage ==========
+const TEMPLATE_DIR = '_templates';
+const TEMPLATE_CONFIG = `${TEMPLATE_DIR}/config.json`;
 
-// Save template data to Supabase as JSON file
+// Save template config JSON (metadata only, no image data)
 async function saveTemplateConfig(templateData) {
-    if (!isConfigured()) return { error: 'Not configured' };
-    try {
-        // Strip out refImages (too large) and thumbnails (too large) for config file
-        // Only save metadata: name, prompt, description, icon, category, isCustom, bgColor
-        const stripped = {};
-        for (const [id, data] of Object.entries(templateData)) {
-            stripped[id] = {};
-            for (const key of ['name', 'prompt', 'description', 'icon', 'category', 'isCustom', 'bgColor']) {
-                if (data[key] !== undefined) stripped[id][key] = data[key];
-            }
+    const config = {};
+    for (const [id, data] of Object.entries(templateData)) {
+        config[id] = {};
+        for (const k of ['name', 'prompt', 'description', 'icon', 'category', 'isCustom', 'bgColor']) {
+            if (data[k] !== undefined) config[id][k] = data[k];
         }
-        const json = JSON.stringify(stripped, null, 2);
-        const blob = new Blob([json], { type: 'application/json' });
-
-        const headers = await storageHeaders();
-        headers['Content-Type'] = 'application/json';
-
-        // Try PUT (upsert) first
-        let res = await fetch(storageUrl(`/object/${BUCKET}/${TEMPLATE_DATA_FILE}`), {
-            method: 'PUT', headers, body: blob,
-        });
-        if (!res.ok) {
-            // Try POST (create)
-            res = await fetch(storageUrl(`/object/${BUCKET}/${TEMPLATE_DATA_FILE}`), {
-                method: 'POST', headers, body: blob,
-            });
-        }
-        return res.ok ? { success: true } : { error: `Save failed: ${res.status}` };
-    } catch (e) {
-        return { error: e.message };
+        const refs = data.refImages || data.refImageUrls || [];
+        config[id].refCount = refs.filter(r => r).length;
+        config[id].hasThumbnail = !!(data.thumbnail || data.thumbnailUrl);
     }
+    const blob = new Blob([JSON.stringify(config, null, 2)], { type: 'application/json' });
+    return (await uploadBlob(TEMPLATE_CONFIG, blob, 'application/json')) ? { success: true } : { error: 'fail' };
 }
 
-// Load template data from Supabase
+// Load template config JSON
 async function loadTemplateConfig() {
-    if (!isConfigured()) return null;
     try {
-        const url = getPublicUrl(TEMPLATE_DATA_FILE);
-        const res = await fetch(url + '?t=' + Date.now()); // cache bust
+        const res = await fetch(getPublicUrl(TEMPLATE_CONFIG) + '?t=' + Date.now());
         if (!res.ok) return null;
         return await res.json();
-    } catch {
-        return null;
-    }
+    } catch { return null; }
 }
 
-// Save template thumbnail as separate image file
+// Save thumbnail image
 async function saveTemplateThumbnail(templateId, base64Data) {
-    if (!isConfigured()) return { error: 'Not configured' };
-    const filename = `_config/thumb_${templateId}.jpg`;
-    // Convert to smaller image
-    const byteChars = atob(base64Data);
-    const byteArray = new Uint8Array(byteChars.length);
-    for (let i = 0; i < byteChars.length; i++) {
-        byteArray[i] = byteChars.charCodeAt(i);
-    }
-    const blob = new Blob([byteArray], { type: 'image/jpeg' });
-
-    const headers = await storageHeaders();
-    headers['Content-Type'] = 'image/jpeg';
-
-    let res = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
-        method: 'PUT', headers, body: blob,
-    });
-    if (!res.ok) {
-        res = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
-            method: 'POST', headers, body: blob,
-        });
-    }
-    return res.ok ? { success: true, url: getPublicUrl(filename) } : { error: `Upload failed: ${res.status}` };
+    const ok = await uploadBlob(`${TEMPLATE_DIR}/thumb_${templateId}.jpg`, base64ToBlob(base64Data), 'image/jpeg');
+    return ok ? { success: true } : { error: 'fail' };
 }
 
-// Get template thumbnail URL
-function getTemplateThumbnailUrl(templateId) {
-    return getPublicUrl(`_config/thumb_${templateId}.jpg`);
+// Save ref images (array of base64)
+async function saveTemplateRefImages(templateId, base64Images) {
+    const results = [];
+    for (let i = 0; i < base64Images.length; i++) {
+        if (!base64Images[i]) continue;
+        const ok = await uploadBlob(`${TEMPLATE_DIR}/ref_${templateId}_${i}.jpg`, base64ToBlob(base64Images[i]), 'image/jpeg');
+        results.push({ index: i, ok });
+    }
+    return results;
+}
+
+// Delete all files for a template
+async function deleteTemplateFiles(templateId) {
+    const files = [`${TEMPLATE_DIR}/thumb_${templateId}.jpg`];
+    for (let i = 0; i < 5; i++) files.push(`${TEMPLATE_DIR}/ref_${templateId}_${i}.jpg`);
+    await deleteFiles(files);
+}
+
+// URL generators
+function getTemplateThumbnailUrl(id) { return getPublicUrl(`${TEMPLATE_DIR}/thumb_${id}.jpg`); }
+function getTemplateRefImageUrl(id, i) { return getPublicUrl(`${TEMPLATE_DIR}/ref_${id}_${i}.jpg`); }
+
+// Load FULL template data (config + construct image URLs)
+async function loadFullTemplateData() {
+    const config = await loadTemplateConfig();
+    if (!config) return null;
+    const result = {};
+    for (const [id, data] of Object.entries(config)) {
+        result[id] = { ...data };
+        if (data.hasThumbnail) result[id].thumbnailUrl = getTemplateThumbnailUrl(id);
+        if (data.refCount > 0) {
+            result[id].refImageUrls = [];
+            for (let i = 0; i < data.refCount; i++) result[id].refImageUrls.push(getTemplateRefImageUrl(id, i));
+        }
+    }
+    return result;
+}
+
+// Fetch image URL as base64 (for Gemini API)
+async function fetchImageBase64(url) {
+    try {
+        const res = await fetch(url);
+        if (!res.ok) return null;
+        const blob = await res.blob();
+        return new Promise(resolve => {
+            const r = new FileReader();
+            r.onload = () => resolve(r.result.split(',')[1]);
+            r.onerror = () => resolve(null);
+            r.readAsDataURL(blob);
+        });
+    } catch { return null; }
+}
+
+// Fetch all ref images for a template as base64
+async function fetchRefImagesBase64(templateId, count) {
+    const promises = [];
+    for (let i = 0; i < count; i++) promises.push(fetchImageBase64(getTemplateRefImageUrl(templateId, i)));
+    return (await Promise.all(promises)).filter(r => r);
 }
 
 export {
-    getConfig,
-    saveConfig,
-    isConfigured,
-    uploadImage,
-    uploadWithCleanup,
-    listFiles,
-    deleteFile,
-    deleteFiles,
-    getPublicUrl,
-    getStorageUsed,
-    autoCleanup,
-    testConnection,
-    saveTemplateConfig,
-    loadTemplateConfig,
-    saveTemplateThumbnail,
-    getTemplateThumbnailUrl,
-    BUCKET,
-    MAX_STORAGE_MB,
+    getConfig, saveConfig, isConfigured,
+    uploadImage, uploadWithCleanup,
+    listFiles, deleteFile, deleteFiles,
+    getPublicUrl, getStorageUsed, autoCleanup, testConnection,
+    saveTemplateConfig, loadTemplateConfig, saveTemplateThumbnail,
+    saveTemplateRefImages, deleteTemplateFiles,
+    getTemplateThumbnailUrl, getTemplateRefImageUrl,
+    loadFullTemplateData, fetchImageBase64, fetchRefImagesBase64,
+    BUCKET, MAX_STORAGE_MB,
 };

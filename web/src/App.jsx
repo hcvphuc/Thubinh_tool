@@ -264,13 +264,24 @@ function App() {
     }
   }, []);
 
-  // ========== Load saved template data from IndexedDB on mount ==========
+  // ========== Load template data from cloud (primary) + IndexedDB (fallback) ==========
   useEffect(() => {
     (async () => {
       try {
-        // Load new template_data store
+        // 1. Try cloud first
+        const cloudData = await supa.loadFullTemplateData();
+        if (cloudData && Object.keys(cloudData).length > 0) {
+          setTemplateData(cloudData);
+          console.log(`☁️ Loaded ${Object.keys(cloudData).length} templates from cloud`);
+          return; // Cloud data loaded, skip IndexedDB
+        }
+      } catch (e) {
+        console.warn('Cloud load error:', e);
+      }
+
+      // 2. Fallback to IndexedDB
+      try {
         const data = await getAllTemplateData();
-        // Migrate old template_refs if any
         const oldRefs = await migrateOldRefs();
         if (Object.keys(oldRefs).length > 0) {
           for (const [id, images] of Object.entries(oldRefs)) {
@@ -282,42 +293,29 @@ function App() {
           }
         }
         setTemplateData(data);
-        const count = Object.keys(data).length;
-        if (count > 0) console.log(`Loaded ${count} template data entries from IndexedDB`);
+        if (Object.keys(data).length > 0) console.log(`📦 Loaded ${Object.keys(data).length} templates from IndexedDB`);
       } catch (err) {
         console.warn('IndexedDB load error:', err);
       }
     })();
   }, []);
 
-  // Auto-load Supabase storage info + template config on mount
+  // Auto-load Supabase storage info on mount
   useEffect(() => {
     supa.getStorageUsed().then(info => {
       setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
     }).catch(() => { });
-    // Load template config from cloud
-    supa.loadTemplateConfig().then(cloudData => {
-      if (cloudData && Object.keys(cloudData).length > 0) {
-        setTemplateData(prev => {
-          const merged = { ...prev };
-          for (const [id, data] of Object.entries(cloudData)) {
-            merged[id] = { ...(merged[id] || {}), ...data };
-            if (prev[id]?.refImages) merged[id].refImages = prev[id].refImages;
-            if (prev[id]?.thumbnail) merged[id].thumbnail = prev[id].thumbnail;
-          }
-          return merged;
-        });
-        console.log(`☁️ Loaded ${Object.keys(cloudData).length} template configs from cloud`);
-      }
-    }).catch(() => { });
   }, []);
 
   // ========== Merged template list ==========
+  // Helper: detect URL vs base64
+  const isUrl = (s) => s && (s.startsWith('http://') || s.startsWith('https://'));
+  const getImgSrc = (data) => isUrl(data) ? data : `data:image/jpeg;base64,${data}`;
+
   const allTemplates = useMemo(() => {
-    // Start with defaults, apply overrides
     const merged = DEFAULT_TEMPLATES.map(t => {
       const d = templateData[t.id];
-      if (!d) return { ...t, refImages: [], thumbnail: null };
+      if (!d) return { ...t, refImages: [], refImageUrls: [], thumbnail: null, thumbnailUrl: null };
       return {
         ...t,
         name: d.name || t.name,
@@ -325,10 +323,13 @@ function App() {
         description: d.description || t.description,
         icon: d.icon || t.icon,
         thumbnail: d.thumbnail || null,
+        thumbnailUrl: d.thumbnailUrl || null,
         refImages: d.refImages || [],
+        refImageUrls: d.refImageUrls || [],
+        refCount: d.refCount || (d.refImages || []).length || (d.refImageUrls || []).length,
       };
     });
-    // Add custom templates (key = template id, value = data)
+    // Add custom templates
     Object.entries(templateData).forEach(([key, d]) => {
       if (d.isCustom && !merged.find(t => t.id === key)) {
         merged.push({
@@ -340,7 +341,10 @@ function App() {
           description: d.description || '',
           prompt: d.prompt || '',
           thumbnail: d.thumbnail || null,
+          thumbnailUrl: d.thumbnailUrl || null,
           refImages: d.refImages || [],
+          refImageUrls: d.refImageUrls || [],
+          refCount: d.refCount || (d.refImages || []).length || (d.refImageUrls || []).length,
           isCustom: true,
         });
       }
@@ -597,8 +601,14 @@ function App() {
       if (!template) throw new Error('Template không tìm thấy');
       addLog('Template: ' + template.name);
 
-      // Pre-compress images
-      const refImages = template.refImages || [];
+      // Pre-compress images - fetch from cloud if needed
+      let refImages = template.refImages || [];
+      if (refImages.length === 0 && template.refCount > 0) {
+        setStatus('Đang tải ảnh mẫu từ cloud...');
+        addLog('☁️ Fetching ref images from cloud...');
+        refImages = await supa.fetchRefImagesBase64(selectedTemplate, template.refCount);
+        addLog(`☁️ Fetched ${refImages.length} ref images`);
+      }
       const hasRefs = refImages.length > 0;
       setStatus('Đang nén ảnh...');
       const compressedRefs = hasRefs ? await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75))) : [];
@@ -823,6 +833,11 @@ function App() {
       const template = allTemplates.find(t => t.id === batchSelectedTemplate);
       if (template) {
         let refImages = [...(template.refImages || [])];
+        // Fetch from cloud if no local base64
+        if (refImages.length === 0 && template.refCount > 0) {
+          addLog('☁️ Fetching batch ref images from cloud...');
+          refImages = await supa.fetchRefImagesBase64(batchSelectedTemplate, template.refCount);
+        }
         if (template.thumbnail) refImages = [template.thumbnail, ...refImages];
         refImages = [...new Set(refImages)];
         compBatchRefs = await Promise.all(refImages.map(img => compressBase64Image(img, 1024, 0.75)));
@@ -1132,7 +1147,6 @@ function App() {
     const newImages = [];
     for (const file of files.slice(0, 3)) {
       const b64 = await readFileAsBase64(file);
-      // Compress for storage — 1024px max, JPEG 80% quality
       const compressed = await compressBase64Image(b64, 1024, 0.8);
       newImages.push(compressed);
       addLog(`Ref compressed: ${(b64.length / 1024).toFixed(0)}KB → ${(compressed.length / 1024).toFixed(0)}KB`);
@@ -1141,8 +1155,23 @@ function App() {
     const existing = (templateData[refUploadTarget]?.refImages) || [];
     const merged = [...existing, ...newImages].slice(0, 3);
 
+    // Save to IndexedDB as backup
     await saveTemplateData(refUploadTarget, { refImages: merged });
-    setTemplateData(prev => ({ ...prev, [refUploadTarget]: { ...(prev[refUploadTarget] || {}), refImages: merged } }));
+
+    // Upload to cloud
+    addLog(`☁️ Uploading ${merged.length} ref images...`);
+    supa.saveTemplateRefImages(refUploadTarget, merged).then(results => {
+      const ok = results.filter(r => r.ok).length;
+      addLog(`☁️ Uploaded ${ok}/${merged.length} ref images`);
+      // Update to URL-based refs
+      const refImageUrls = [];
+      for (let i = 0; i < merged.length; i++) refImageUrls.push(supa.getTemplateRefImageUrl(refUploadTarget, i));
+      const newData = { ...templateData, [refUploadTarget]: { ...(templateData[refUploadTarget] || {}), refImages: merged, refImageUrls, refCount: merged.length } };
+      setTemplateData(newData);
+      supa.saveTemplateConfig(newData);
+    });
+
+    setTemplateData(prev => ({ ...prev, [refUploadTarget]: { ...(prev[refUploadTarget] || {}), refImages: merged, refCount: merged.length } }));
     addLog(`Saved ${merged.length} ref image(s) for: ${refUploadTarget}`);
     setRefUploadTarget(null);
   }
@@ -1150,8 +1179,12 @@ function App() {
   // Delete reference images
   async function handleDeleteRefImages(templateId) {
     await saveTemplateData(templateId, { refImages: [] });
-    setTemplateData(prev => ({ ...prev, [templateId]: { ...(prev[templateId] || {}), refImages: [] } }));
+    setTemplateData(prev => ({ ...prev, [templateId]: { ...(prev[templateId] || {}), refImages: [], refImageUrls: [], refCount: 0 } }));
     addLog(`Deleted ref images for: ${templateId}`);
+    // Delete from cloud
+    supa.deleteTemplateFiles(templateId).then(() => addLog('☁️ Cloud ref images deleted'));
+    const newData = { ...templateData, [templateId]: { ...(templateData[templateId] || {}), refImages: [], refImageUrls: [], refCount: 0 } };
+    supa.saveTemplateConfig(newData);
   }
 
   // Start editing a template
@@ -1245,7 +1278,11 @@ function App() {
     addLog(`Generating thumbnail for: ${template.name}`);
 
     try {
-      const refImages = template.refImages || [];
+      let refImages = template.refImages || [];
+      if (refImages.length === 0 && template.refCount > 0) {
+        setStatus('Đang tải ảnh mẫu từ cloud...');
+        refImages = await supa.fetchRefImagesBase64(templateId, template.refCount);
+      }
       const parts = [];
       if (refImages.length > 0) {
         parts.push({ text: 'Based on these reference studio images:' });
@@ -1266,7 +1303,8 @@ function App() {
       const img = extractImage(data);
       if (img) {
         await saveTemplateData(templateId, { thumbnail: img.data });
-        const newData = { ...templateData, [templateId]: { ...(templateData[templateId] || {}), thumbnail: img.data } };
+        const thumbnailUrl = supa.getTemplateThumbnailUrl(templateId);
+        const newData = { ...templateData, [templateId]: { ...(templateData[templateId] || {}), thumbnail: img.data, thumbnailUrl, hasThumbnail: true } };
         setTemplateData(newData);
         addLog('Thumbnail generated!');
         setStatus('Thumbnail đã tạo!');
@@ -1286,8 +1324,9 @@ function App() {
 
   // ========== TEMPLATE CARD with thumbnail ==========
   function TemplateCard({ t, selected, onSelect }) {
-    const hasThumbnail = !!t.thumbnail;
-    const hasRefs = (t.refImages || []).length > 0;
+    const thumbSrc = t.thumbnailUrl || (t.thumbnail ? `data:image/png;base64,${t.thumbnail}` : null);
+    const hasThumbnail = !!thumbSrc;
+    const refCount = t.refCount || (t.refImages || []).length || (t.refImageUrls || []).length;
     const isCustom = t.isCustom;
 
     return (
@@ -1297,11 +1336,11 @@ function App() {
         onClick={() => onSelect(t.id)}
       >
         {hasThumbnail && (
-          <img src={`data:image/png;base64,${t.thumbnail}`} alt={t.name}
+          <img src={thumbSrc} alt={t.name}
             style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: 0.7 }} />
         )}
-        {hasRefs && (
-          <div style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(0,230,118,0.9)', color: '#000', fontSize: 9, fontWeight: 700, padding: '2px 5px', borderRadius: 4, zIndex: 2 }}>📸 {t.refImages.length}</div>
+        {refCount > 0 && (
+          <div style={{ position: 'absolute', top: 4, right: 4, background: 'rgba(0,230,118,0.9)', color: '#000', fontSize: 9, fontWeight: 700, padding: '2px 5px', borderRadius: 4, zIndex: 2 }}>📸 {refCount}</div>
         )}
         {isCustom && (
           <div style={{ position: 'absolute', top: 4, left: 4, background: 'rgba(124,77,255,0.9)', color: '#fff', fontSize: 9, fontWeight: 700, padding: '2px 5px', borderRadius: 4, zIndex: 2 }}>✨</div>
@@ -1318,7 +1357,8 @@ function App() {
     const familyTemplates = allTemplates.filter(t => t.category === 'family');
     const customTemplates = allTemplates.filter(t => t.isCustom);
     const selTemplate = selectedTemplate ? allTemplates.find(t => t.id === selectedTemplate) : null;
-    const selRefs = selTemplate?.refImages || [];
+    const selRefs = selTemplate?.refImages?.length > 0 ? selTemplate.refImages : (selTemplate?.refImageUrls || []);
+    const selRefsAreUrls = selRefs.length > 0 && isUrl(selRefs[0]);
     const isCustom = selTemplate?.isCustom;
     const isEditing = editingTemplate === selectedTemplate;
     const hasOverride = selectedTemplate && templateData[selectedTemplate] && (templateData[selectedTemplate].prompt || templateData[selectedTemplate].name);
@@ -1429,7 +1469,7 @@ function App() {
           <div className="card" style={{ marginBottom: 16 }}>
             <div className="card-title">
               <span>📸</span> Ảnh mẫu studio
-              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 8 }}>(Lưu cố định)</span>
+              <span style={{ fontSize: 11, fontWeight: 400, color: 'var(--text-muted)', marginLeft: 8 }}>(Lưu trên cloud)</span>
             </div>
 
             {selRefs.length > 0 ? (
@@ -1437,7 +1477,7 @@ function App() {
                 <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
                   {selRefs.map((img, i) => (
                     <div key={i} style={{ position: 'relative', borderRadius: 8, overflow: 'hidden', border: '1px solid var(--border)' }}>
-                      <img src={`data:image/jpeg;base64,${img}`} alt={`ref-${i}`} style={{ width: 100, height: 100, objectFit: 'cover', display: 'block' }} />
+                      <img src={getImgSrc(img)} alt={`ref-${i}`} style={{ width: 100, height: 100, objectFit: 'cover', display: 'block' }} />
                     </div>
                   ))}
                 </div>
@@ -1473,10 +1513,10 @@ function App() {
             )}
 
             {/* Thumbnail preview */}
-            {selTemplate.thumbnail && (
+            {(selTemplate.thumbnail || selTemplate.thumbnailUrl) && (
               <div style={{ marginTop: 12 }}>
                 <label style={{ fontSize: 11, color: 'var(--text-muted)', display: 'block', marginBottom: 6 }}>Thumbnail hiện tại:</label>
-                <img src={`data:image/png;base64,${selTemplate.thumbnail}`} alt="thumbnail" style={{ width: 140, height: 140, objectFit: 'cover', borderRadius: 8, border: '1px solid var(--border)' }} />
+                <img src={selTemplate.thumbnailUrl || `data:image/png;base64,${selTemplate.thumbnail}`} alt="thumbnail" style={{ width: 140, height: 140, objectFit: 'cover', borderRadius: 8, border: '1px solid var(--border)' }} />
               </div>
             )}
 
