@@ -3,21 +3,18 @@
 const BUCKET = 'photos';
 const MAX_STORAGE_MB = 900; // Auto-cleanup when exceeding this
 
-// Get config from localStorage
+// Hardcoded Supabase config (anon key is safe for frontend - secured by RLS)
+const SUPABASE_URL = 'https://grmofxaelrangzcbfifb.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdybW9meGFlbHJhbmd6Y2JmaWZiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NzExNzMsImV4cCI6MjA4NzA0NzE3M30.tU8MBJLsMrNQNAHQePG_-wY-3DGZShmdraOoJsUUEZA';
+
 function getConfig() {
-    const url = localStorage.getItem('supabase_url') || '';
-    const key = localStorage.getItem('supabase_key') || '';
-    return { url: url.replace(/\/$/, ''), key };
+    return { url: SUPABASE_URL, key: SUPABASE_KEY };
 }
 
-function saveConfig(url, key) {
-    localStorage.setItem('supabase_url', url.replace(/\/$/, ''));
-    localStorage.setItem('supabase_key', key);
-}
+function saveConfig() { /* no-op, hardcoded */ }
 
 function isConfigured() {
-    const { url, key } = getConfig();
-    return url.length > 10 && key.length > 10;
+    return true;
 }
 
 // ========== Storage API calls ==========

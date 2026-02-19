@@ -245,11 +245,7 @@ function App() {
   const [galleryPreview, setGalleryPreview] = useState(null); // URL for lightbox
 
   // Supabase Storage
-  const [supaUrl, setSupaUrl] = useState(localStorage.getItem('supabase_url') || '');
-  const [supaKey, setSupaKey] = useState(localStorage.getItem('supabase_key') || '');
-  const [supaStatus, setSupaStatus] = useState(''); // '', 'ok', 'error'
   const [supaStorageInfo, setSupaStorageInfo] = useState(null); // { totalMB, totalFiles }
-  const [showSupaConfig, setShowSupaConfig] = useState(false);
 
   // Auto-upload to Supabase after image generation
   const autoUploadToSupabase = useCallback(async (imageData, mimeType, prefix = 'thubinh') => {
@@ -294,34 +290,26 @@ function App() {
     })();
   }, []);
 
-  // Auto-check Supabase on mount + load template config
+  // Auto-load Supabase storage info + template config on mount
   useEffect(() => {
-    if (supa.isConfigured()) {
-      supa.testConnection().then(test => {
-        if (test.ok) {
-          setSupaStatus('ok');
-          supa.getStorageUsed().then(info => {
-            setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
-          });
-          // Load template config from cloud
-          supa.loadTemplateConfig().then(cloudData => {
-            if (cloudData && Object.keys(cloudData).length > 0) {
-              setTemplateData(prev => {
-                const merged = { ...prev };
-                for (const [id, data] of Object.entries(cloudData)) {
-                  merged[id] = { ...(merged[id] || {}), ...data };
-                  // Keep local refImages/thumbnail if cloud doesn't have them
-                  if (prev[id]?.refImages) merged[id].refImages = prev[id].refImages;
-                  if (prev[id]?.thumbnail) merged[id].thumbnail = prev[id].thumbnail;
-                }
-                return merged;
-              });
-              console.log(`☁️ Loaded ${Object.keys(cloudData).length} template configs from cloud`);
-            }
-          });
-        }
-      });
-    }
+    supa.getStorageUsed().then(info => {
+      setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+    }).catch(() => { });
+    // Load template config from cloud
+    supa.loadTemplateConfig().then(cloudData => {
+      if (cloudData && Object.keys(cloudData).length > 0) {
+        setTemplateData(prev => {
+          const merged = { ...prev };
+          for (const [id, data] of Object.entries(cloudData)) {
+            merged[id] = { ...(merged[id] || {}), ...data };
+            if (prev[id]?.refImages) merged[id].refImages = prev[id].refImages;
+            if (prev[id]?.thumbnail) merged[id].thumbnail = prev[id].thumbnail;
+          }
+          return merged;
+        });
+        console.log(`☁️ Loaded ${Object.keys(cloudData).length} template configs from cloud`);
+      }
+    }).catch(() => { });
   }, []);
 
   // ========== Merged template list ==========
@@ -1892,59 +1880,13 @@ function App() {
           </button>
         </div>
 
-        {/* Supabase Storage Config */}
-        <div style={{ marginTop: 8 }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setShowSupaConfig(!showSupaConfig)}>
-            <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
-              ☁️ Cloud Storage
-              {supaStatus === 'ok' && <span style={{ color: '#4caf50' }}> ● Đã kết nối</span>}
-              {supaStorageInfo && <span> ({supaStorageInfo.totalMB.toFixed(0)}MB / {supa.MAX_STORAGE_MB}MB — {supaStorageInfo.totalFiles} ảnh)</span>}
-            </span>
-            <span style={{ fontSize: 10 }}>{showSupaConfig ? '▲' : '▼'}</span>
+        {/* Cloud Storage Status (auto-connected) */}
+        {supaStorageInfo && (
+          <div style={{ marginTop: 6, fontSize: 12, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ color: '#4caf50' }}>●</span>
+            ☁️ {supaStorageInfo.totalFiles} ảnh • {supaStorageInfo.totalMB.toFixed(0)}MB / {supa.MAX_STORAGE_MB}MB
           </div>
-          {showSupaConfig && (
-            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
-              <input
-                className="input-field"
-                type="text"
-                placeholder="Supabase URL (https://xxx.supabase.co)"
-                value={supaUrl}
-                onChange={e => setSupaUrl(e.target.value)}
-                style={{ fontSize: 12 }}
-              />
-              <input
-                className="input-field"
-                type="password"
-                placeholder="Supabase Anon Key"
-                value={supaKey}
-                onChange={e => setSupaKey(e.target.value)}
-                style={{ fontSize: 12 }}
-              />
-              <div style={{ display: 'flex', gap: 8 }}>
-                <button className="btn btn-secondary btn-sm" onClick={async () => {
-                  supa.saveConfig(supaUrl, supaKey);
-                  const test = await supa.testConnection();
-                  if (test.ok) {
-                    setSupaStatus('ok');
-                    const info = await supa.getStorageUsed();
-                    setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
-                    alert('✅ Kết nối thành công!');
-                  } else {
-                    setSupaStatus('error');
-                    alert('❌ ' + test.error);
-                  }
-                }}>
-                  🔗 Kết nối
-                </button>
-                {supaStorageInfo && (
-                  <span style={{ fontSize: 12, color: 'var(--text-muted)', alignSelf: 'center' }}>
-                    {supaStorageInfo.totalMB.toFixed(1)}MB / {supa.MAX_STORAGE_MB}MB
-                  </span>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
+        )}
       </header>
 
       {/* Tabs */}
