@@ -233,6 +233,88 @@ async function testConnection() {
     }
 }
 
+// ========== Template Data Sync ==========
+const TEMPLATE_DATA_FILE = '_config/templates.json';
+
+// Save template data to Supabase as JSON file
+async function saveTemplateConfig(templateData) {
+    if (!isConfigured()) return { error: 'Not configured' };
+    try {
+        // Strip out refImages (too large) and thumbnails (too large) for config file
+        // Only save metadata: name, prompt, description, icon, category, isCustom, bgColor
+        const stripped = {};
+        for (const [id, data] of Object.entries(templateData)) {
+            stripped[id] = {};
+            for (const key of ['name', 'prompt', 'description', 'icon', 'category', 'isCustom', 'bgColor']) {
+                if (data[key] !== undefined) stripped[id][key] = data[key];
+            }
+        }
+        const json = JSON.stringify(stripped, null, 2);
+        const blob = new Blob([json], { type: 'application/json' });
+
+        const headers = await storageHeaders();
+        headers['Content-Type'] = 'application/json';
+
+        // Try PUT (upsert) first
+        let res = await fetch(storageUrl(`/object/${BUCKET}/${TEMPLATE_DATA_FILE}`), {
+            method: 'PUT', headers, body: blob,
+        });
+        if (!res.ok) {
+            // Try POST (create)
+            res = await fetch(storageUrl(`/object/${BUCKET}/${TEMPLATE_DATA_FILE}`), {
+                method: 'POST', headers, body: blob,
+            });
+        }
+        return res.ok ? { success: true } : { error: `Save failed: ${res.status}` };
+    } catch (e) {
+        return { error: e.message };
+    }
+}
+
+// Load template data from Supabase
+async function loadTemplateConfig() {
+    if (!isConfigured()) return null;
+    try {
+        const url = getPublicUrl(TEMPLATE_DATA_FILE);
+        const res = await fetch(url + '?t=' + Date.now()); // cache bust
+        if (!res.ok) return null;
+        return await res.json();
+    } catch {
+        return null;
+    }
+}
+
+// Save template thumbnail as separate image file
+async function saveTemplateThumbnail(templateId, base64Data) {
+    if (!isConfigured()) return { error: 'Not configured' };
+    const filename = `_config/thumb_${templateId}.jpg`;
+    // Convert to smaller image
+    const byteChars = atob(base64Data);
+    const byteArray = new Uint8Array(byteChars.length);
+    for (let i = 0; i < byteChars.length; i++) {
+        byteArray[i] = byteChars.charCodeAt(i);
+    }
+    const blob = new Blob([byteArray], { type: 'image/jpeg' });
+
+    const headers = await storageHeaders();
+    headers['Content-Type'] = 'image/jpeg';
+
+    let res = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
+        method: 'PUT', headers, body: blob,
+    });
+    if (!res.ok) {
+        res = await fetch(storageUrl(`/object/${BUCKET}/${filename}`), {
+            method: 'POST', headers, body: blob,
+        });
+    }
+    return res.ok ? { success: true, url: getPublicUrl(filename) } : { error: `Upload failed: ${res.status}` };
+}
+
+// Get template thumbnail URL
+function getTemplateThumbnailUrl(templateId) {
+    return getPublicUrl(`_config/thumb_${templateId}.jpg`);
+}
+
 export {
     getConfig,
     saveConfig,
@@ -246,6 +328,10 @@ export {
     getStorageUsed,
     autoCleanup,
     testConnection,
+    saveTemplateConfig,
+    loadTemplateConfig,
+    saveTemplateThumbnail,
+    getTemplateThumbnailUrl,
     BUCKET,
     MAX_STORAGE_MB,
 };

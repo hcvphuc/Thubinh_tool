@@ -294,7 +294,7 @@ function App() {
     })();
   }, []);
 
-  // Auto-check Supabase on mount
+  // Auto-check Supabase on mount + load template config
   useEffect(() => {
     if (supa.isConfigured()) {
       supa.testConnection().then(test => {
@@ -302,6 +302,22 @@ function App() {
           setSupaStatus('ok');
           supa.getStorageUsed().then(info => {
             setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+          });
+          // Load template config from cloud
+          supa.loadTemplateConfig().then(cloudData => {
+            if (cloudData && Object.keys(cloudData).length > 0) {
+              setTemplateData(prev => {
+                const merged = { ...prev };
+                for (const [id, data] of Object.entries(cloudData)) {
+                  merged[id] = { ...(merged[id] || {}), ...data };
+                  // Keep local refImages/thumbnail if cloud doesn't have them
+                  if (prev[id]?.refImages) merged[id].refImages = prev[id].refImages;
+                  if (prev[id]?.thumbnail) merged[id].thumbnail = prev[id].thumbnail;
+                }
+                return merged;
+              });
+              console.log(`☁️ Loaded ${Object.keys(cloudData).length} template configs from cloud`);
+            }
           });
         }
       });
@@ -324,11 +340,11 @@ function App() {
         refImages: d.refImages || [],
       };
     });
-    // Add custom templates
-    Object.values(templateData).forEach(d => {
-      if (d.isCustom && !merged.find(t => t.id === d.id)) {
+    // Add custom templates (key = template id, value = data)
+    Object.entries(templateData).forEach(([key, d]) => {
+      if (d.isCustom && !merged.find(t => t.id === key)) {
         merged.push({
-          id: d.id,
+          id: key,
           name: d.name || 'Custom Template',
           icon: d.icon || '🎨',
           bgColor: d.bgColor || 'linear-gradient(135deg, #667eea, #764ba2)',
@@ -1169,12 +1185,12 @@ function App() {
     if (!editingTemplate) return;
     const updates = { ...editForm };
     await saveTemplateData(editingTemplate, updates);
-    setTemplateData(prev => ({
-      ...prev,
-      [editingTemplate]: { ...(prev[editingTemplate] || {}), ...updates }
-    }));
+    const newData = { ...templateData, [editingTemplate]: { ...(templateData[editingTemplate] || {}), ...updates } };
+    setTemplateData(newData);
     addLog(`Template saved: ${editForm.name}`);
     setEditingTemplate(null);
+    // Sync to cloud
+    supa.saveTemplateConfig(newData).then(r => { if (r.success) addLog('☁️ Templates synced'); });
   }
 
   // Add new custom template
@@ -1192,10 +1208,13 @@ function App() {
       thumbnail: null,
     };
     await saveTemplateData(id, data);
-    setTemplateData(prev => ({ ...prev, [id]: data }));
+    const newData = { ...templateData, [id]: data };
+    setTemplateData(newData);
     setSelectedTemplate(id);
     startEditTemplate(id);
     addLog(`New template created: ${id}`);
+    // Sync to cloud
+    supa.saveTemplateConfig(newData).then(r => { if (r.success) addLog('☁️ Templates synced'); });
   }
 
   // Delete custom template
@@ -1204,14 +1223,14 @@ function App() {
     if (!t) return;
     if (!confirm(`Xoá template "${t.name}"?`)) return;
     await deleteTemplateData(templateId);
-    setTemplateData(prev => {
-      const next = { ...prev };
-      delete next[templateId];
-      return next;
-    });
+    const newData = { ...templateData };
+    delete newData[templateId];
+    setTemplateData(newData);
     if (selectedTemplate === templateId) setSelectedTemplate(null);
     setEditingTemplate(null);
     addLog(`Deleted template: ${t.name}`);
+    // Sync to cloud
+    supa.saveTemplateConfig(newData).then(r => { if (r.success) addLog('☁️ Templates synced'); });
   }
 
   // Reset built-in template to defaults
@@ -1259,13 +1278,15 @@ function App() {
       const img = extractImage(data);
       if (img) {
         await saveTemplateData(templateId, { thumbnail: img.data });
-        setTemplateData(prev => ({
-          ...prev,
-          [templateId]: { ...(prev[templateId] || {}), thumbnail: img.data }
-        }));
+        const newData = { ...templateData, [templateId]: { ...(templateData[templateId] || {}), thumbnail: img.data } };
+        setTemplateData(newData);
         addLog('Thumbnail generated!');
         setStatus('Thumbnail đã tạo!');
         addCost('image', 1);
+        // Upload thumbnail to cloud
+        const compressed = await compressBase64Image(img.data, 512, 0.8);
+        supa.saveTemplateThumbnail(templateId, compressed).then(r => { if (r.success) addLog('☁️ Thumbnail uploaded'); });
+        supa.saveTemplateConfig(newData).then(r => { if (r.success) addLog('☁️ Templates synced'); });
       } else throw new Error('No image');
     } catch (e) {
       addLog('Thumbnail error: ' + e.message);
