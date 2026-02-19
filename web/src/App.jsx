@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
 import './App.css';
 import { saveTemplateData, getAllTemplateData, deleteTemplateData, migrateOldRefs } from './db.js';
 import { validateFaceAnatomy } from './FaceQC.js';
+import * as supa from './supabaseStorage.js';
 
 // ========== HELPER: Read file as base64 ==========
 function readFileAsBase64(file) {
@@ -237,6 +238,30 @@ function App() {
   // Logs toggle
   const [showLogs, setShowLogs] = useState(false);
 
+  // Supabase Storage
+  const [supaUrl, setSupaUrl] = useState(localStorage.getItem('supabase_url') || '');
+  const [supaKey, setSupaKey] = useState(localStorage.getItem('supabase_key') || '');
+  const [supaStatus, setSupaStatus] = useState(''); // '', 'ok', 'error'
+  const [supaStorageInfo, setSupaStorageInfo] = useState(null); // { totalMB, totalFiles }
+  const [showSupaConfig, setShowSupaConfig] = useState(false);
+
+  // Auto-upload to Supabase after image generation
+  const autoUploadToSupabase = useCallback(async (imageData, mimeType, prefix = 'thubinh') => {
+    if (!supa.isConfigured()) return;
+    try {
+      // Convert to JPEG via canvas for consistency
+      const filename = `${prefix}_${new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-')}.jpg`;
+      // Compress to reasonable size for storage
+      const compressed = await compressBase64Image(imageData, 2048, 0.9);
+      await supa.uploadWithCleanup(compressed, filename, addLog);
+      // Update storage info
+      const info = await supa.getStorageUsed();
+      setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+    } catch (e) {
+      addLog(`☁️ Upload error: ${e.message}`);
+    }
+  }, []);
+
   // ========== Load saved template data from IndexedDB on mount ==========
   useEffect(() => {
     (async () => {
@@ -261,6 +286,20 @@ function App() {
         console.warn('IndexedDB load error:', err);
       }
     })();
+  }, []);
+
+  // Auto-check Supabase on mount
+  useEffect(() => {
+    if (supa.isConfigured()) {
+      supa.testConnection().then(test => {
+        if (test.ok) {
+          setSupaStatus('ok');
+          supa.getStorageUsed().then(info => {
+            setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+          });
+        }
+      });
+    }
   }, []);
 
   // ========== Merged template list ==========
@@ -447,6 +486,7 @@ function App() {
         addCost('image', 1);
         addCost('textInput', 1000);
         addLog('Image generated!');
+        autoUploadToSupabase(img.data, img.mimeType, 'edit');
       } else throw new Error('No image returned');
     } catch (e) {
       addLog('Error: ' + e.message);
@@ -525,6 +565,7 @@ function App() {
       setResultImage(finalResult);
       setStatus('Xong!');
       addLog('Composite done!');
+      autoUploadToSupabase(finalResult.data, finalResult.mimeType, 'composite');
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -610,6 +651,7 @@ function App() {
       setResultImage(result);
       setStatus('Xong!');
       addLog('DONE!');
+      autoUploadToSupabase(result.data, result.mimeType, 'template');
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -650,6 +692,7 @@ function App() {
         addCost('image', 1);
         addCost('textInput', 1000);
         addLog('Upscaled!');
+        autoUploadToSupabase(img.data, img.mimeType, 'upscale');
       } else throw new Error('No image');
     } catch (e) {
       addLog('Error: ' + e.message);
@@ -721,6 +764,7 @@ function App() {
       setResultImage(result);
       setStatus('Xong!');
       addLog('Face swapped!');
+      autoUploadToSupabase(result.data, result.mimeType, 'faceswap');
     } catch (e) {
       addLog('Error: ' + e.message);
       setStatus('Lỗi');
@@ -1650,6 +1694,60 @@ function App() {
           <button className="btn btn-secondary btn-sm" onClick={handleVerifyKey} disabled={loading}>
             ✓ Xác thực
           </button>
+        </div>
+
+        {/* Supabase Storage Config */}
+        <div style={{ marginTop: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer' }} onClick={() => setShowSupaConfig(!showSupaConfig)}>
+            <span style={{ fontSize: 13, color: 'var(--text-muted)' }}>
+              ☁️ Cloud Storage
+              {supaStatus === 'ok' && <span style={{ color: '#4caf50' }}> ● Đã kết nối</span>}
+              {supaStorageInfo && <span> ({supaStorageInfo.totalMB.toFixed(0)}MB / {supa.MAX_STORAGE_MB}MB — {supaStorageInfo.totalFiles} ảnh)</span>}
+            </span>
+            <span style={{ fontSize: 10 }}>{showSupaConfig ? '▲' : '▼'}</span>
+          </div>
+          {showSupaConfig && (
+            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <input
+                className="input-field"
+                type="text"
+                placeholder="Supabase URL (https://xxx.supabase.co)"
+                value={supaUrl}
+                onChange={e => setSupaUrl(e.target.value)}
+                style={{ fontSize: 12 }}
+              />
+              <input
+                className="input-field"
+                type="password"
+                placeholder="Supabase Anon Key"
+                value={supaKey}
+                onChange={e => setSupaKey(e.target.value)}
+                style={{ fontSize: 12 }}
+              />
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button className="btn btn-secondary btn-sm" onClick={async () => {
+                  supa.saveConfig(supaUrl, supaKey);
+                  const test = await supa.testConnection();
+                  if (test.ok) {
+                    setSupaStatus('ok');
+                    const info = await supa.getStorageUsed();
+                    setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+                    alert('✅ Kết nối thành công!');
+                  } else {
+                    setSupaStatus('error');
+                    alert('❌ ' + test.error);
+                  }
+                }}>
+                  🔗 Kết nối
+                </button>
+                {supaStorageInfo && (
+                  <span style={{ fontSize: 12, color: 'var(--text-muted)', alignSelf: 'center' }}>
+                    {supaStorageInfo.totalMB.toFixed(1)}MB / {supa.MAX_STORAGE_MB}MB
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </header>
 
