@@ -73,14 +73,38 @@ async function fetchWithRetry(url, options, maxRetries = 3, logFn = null) {
   }
 }
 
-// ========== HELPER: Download base64 image ==========
+// ========== HELPER: Download base64 image (converts to JPEG for compatibility) ==========
 function downloadBase64(base64Data, mimeType, filename) {
-  const link = document.createElement('a');
-  link.href = `data:${mimeType};base64,${base64Data}`;
-  link.download = filename || `thubinh_${Date.now()}.png`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
+  // Convert to JPEG for Photoshop compatibility (PS7 can't read WebP/modern PNG)
+  const img = new Image();
+  img.onload = () => {
+    const canvas = document.createElement('canvas');
+    canvas.width = img.width;
+    canvas.height = img.height;
+    const ctx = canvas.getContext('2d');
+    // White background (JPEG doesn't support transparency)
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    // Convert to JPEG 95% quality
+    const jpegUrl = canvas.toDataURL('image/jpeg', 0.95);
+    const link = document.createElement('a');
+    link.href = jpegUrl;
+    link.download = (filename || `thubinh_${Date.now()}`).replace(/\.\w+$/, '.jpg');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+  img.onerror = () => {
+    // Fallback: download as-is if conversion fails
+    const link = document.createElement('a');
+    link.href = `data:${mimeType};base64,${base64Data}`;
+    link.download = filename || `thubinh_${Date.now()}.jpg`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+  img.src = `data:${mimeType};base64,${base64Data}`;
 }
 
 // ========== HELPER: Extract image from Gemini response ==========
