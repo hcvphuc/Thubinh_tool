@@ -238,6 +238,12 @@ function App() {
   // Logs toggle
   const [showLogs, setShowLogs] = useState(false);
 
+  // Gallery (Library)
+  const [galleryFiles, setGalleryFiles] = useState([]);
+  const [galleryLoading, setGalleryLoading] = useState(false);
+  const [galleryFilter, setGalleryFilter] = useState('all');
+  const [galleryPreview, setGalleryPreview] = useState(null); // URL for lightbox
+
   // Supabase Storage
   const [supaUrl, setSupaUrl] = useState(localStorage.getItem('supabase_url') || '');
   const [supaKey, setSupaKey] = useState(localStorage.getItem('supabase_key') || '');
@@ -1676,6 +1682,175 @@ function App() {
     );
   }
 
+  // ========== LIBRARY TAB (Gallery) ==========
+  const loadGallery = useCallback(async () => {
+    if (!supa.isConfigured()) return;
+    setGalleryLoading(true);
+    try {
+      const files = await supa.listFiles('created_at', 'desc');
+      setGalleryFiles(files);
+      const info = await supa.getStorageUsed();
+      setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+    } catch (e) {
+      console.error('Gallery load error:', e);
+    }
+    setGalleryLoading(false);
+  }, []);
+
+  // Auto-load gallery when switching to library tab
+  useEffect(() => {
+    if (activeTab === 'library') loadGallery();
+  }, [activeTab, loadGallery]);
+
+  const handleDeleteGalleryFile = async (filename) => {
+    if (!confirm(`Xóa ảnh ${filename}?`)) return;
+    const ok = await supa.deleteFile(filename);
+    if (ok) {
+      setGalleryFiles(prev => prev.filter(f => f.name !== filename));
+      const info = await supa.getStorageUsed();
+      setSupaStorageInfo({ totalMB: info.totalMB, totalFiles: info.totalFiles });
+    }
+  };
+
+  const handleDownloadGalleryFile = (filename) => {
+    const url = supa.getPublicUrl(filename);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.target = '_blank';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  function renderLibraryTab() {
+    if (!supa.isConfigured()) {
+      return (
+        <div className="card" style={{ textAlign: 'center', padding: 32 }}>
+          <div style={{ fontSize: 48, marginBottom: 16 }}>☁️</div>
+          <h3 style={{ marginBottom: 8 }}>Chưa kết nối Cloud Storage</h3>
+          <p style={{ color: 'var(--text-muted)', marginBottom: 16 }}>Cấu hình Supabase ở header để sử dụng thư viện</p>
+        </div>
+      );
+    }
+
+    const FILTERS = [
+      { id: 'all', label: 'Tất cả' },
+      { id: 'template', label: '🏮 Template' },
+      { id: 'composite', label: '🎭 Ghép nền' },
+      { id: 'edit', label: '✏️ Chỉnh sửa' },
+      { id: 'upscale', label: '⬆️ Upscale' },
+      { id: 'faceswap', label: '🔄 Face Swap' },
+    ];
+
+    const filtered = galleryFilter === 'all' ? galleryFiles : galleryFiles.filter(f => f.name.startsWith(galleryFilter));
+
+    return (
+      <div style={{ width: '100%' }}>
+        {/* Header stats */}
+        <div className="card" style={{ marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 8 }}>
+            <div>
+              <div className="card-title" style={{ marginBottom: 4 }}><span>🖼️</span> Thư viện ảnh</div>
+              {supaStorageInfo && (
+                <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  {supaStorageInfo.totalFiles} ảnh • {supaStorageInfo.totalMB.toFixed(1)}MB / {supa.MAX_STORAGE_MB}MB
+                </span>
+              )}
+            </div>
+            <button className="btn btn-secondary btn-sm" onClick={loadGallery} disabled={galleryLoading}>
+              🔄 {galleryLoading ? 'Đang tải...' : 'Làm mới'}
+            </button>
+          </div>
+
+          {/* Storage bar */}
+          {supaStorageInfo && (
+            <div style={{ marginTop: 12, background: 'var(--bg-input)', borderRadius: 6, height: 6, overflow: 'hidden' }}>
+              <div style={{
+                width: `${Math.min((supaStorageInfo.totalMB / supa.MAX_STORAGE_MB) * 100, 100)}%`,
+                height: '100%',
+                background: supaStorageInfo.totalMB > supa.MAX_STORAGE_MB * 0.8 ? '#ff5252' : 'var(--gradient-accent)',
+                borderRadius: 6,
+                transition: 'width 0.3s'
+              }}></div>
+            </div>
+          )}
+        </div>
+
+        {/* Filters */}
+        <div style={{ display: 'flex', gap: 6, marginBottom: 16, flexWrap: 'wrap' }}>
+          {FILTERS.map(f => (
+            <button
+              key={f.id}
+              className={`btn btn-sm ${galleryFilter === f.id ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setGalleryFilter(f.id)}
+              style={{ fontSize: 12, padding: '4px 10px' }}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+
+        {/* Gallery Grid */}
+        {galleryLoading ? (
+          <div style={{ textAlign: 'center', padding: 32, color: 'var(--text-muted)' }}>
+            <div className="loading-spinner" style={{ margin: '0 auto 12px' }}></div>
+            Đang tải thư viện...
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="card" style={{ textAlign: 'center', padding: 32 }}>
+            <div style={{ fontSize: 48, marginBottom: 8 }}>📭</div>
+            <p style={{ color: 'var(--text-muted)' }}>Chưa có ảnh nào{galleryFilter !== 'all' ? ' trong danh mục này' : ''}</p>
+          </div>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(160px, 1fr))', gap: 12 }}>
+            {filtered.map((file, i) => {
+              const url = supa.getPublicUrl(file.name);
+              const sizeMB = ((file.metadata?.size || 0) / (1024 * 1024)).toFixed(1);
+              const date = file.created_at ? new Date(file.created_at) : null;
+              const dateStr = date ? `${date.getDate()}/${date.getMonth() + 1} ${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}` : '';
+              const typeIcon = file.name.startsWith('template') ? '🏮' : file.name.startsWith('composite') ? '🎭' : file.name.startsWith('edit') ? '✏️' : file.name.startsWith('upscale') ? '⬆️' : file.name.startsWith('faceswap') ? '🔄' : '📷';
+              return (
+                <div key={i} className="card" style={{ padding: 0, overflow: 'hidden', cursor: 'pointer', transition: 'transform 0.2s', position: 'relative' }}
+                  onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.03)'}
+                  onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}
+                >
+                  <img
+                    src={url}
+                    alt={file.name}
+                    style={{ width: '100%', aspectRatio: '3/4', objectFit: 'cover', display: 'block', borderRadius: '8px 8px 0 0' }}
+                    onClick={() => setGalleryPreview(url)}
+                    loading="lazy"
+                  />
+                  <div style={{ padding: '6px 8px' }}>
+                    <div style={{ fontSize: 11, color: 'var(--text-muted)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <span>{typeIcon} {dateStr}</span>
+                      <span>{sizeMB}MB</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 4, marginTop: 4 }}>
+                      <button className="btn btn-sm btn-secondary" style={{ flex: 1, fontSize: 11, padding: '2px 0' }} onClick={(e) => { e.stopPropagation(); handleDownloadGalleryFile(file.name); }}>💾</button>
+                      <button className="btn btn-sm" style={{ flex: 1, fontSize: 11, padding: '2px 0', background: 'rgba(255,82,82,0.15)', color: '#ff5252', border: 'none' }} onClick={(e) => { e.stopPropagation(); handleDeleteGalleryFile(file.name); }}>🗑</button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* Lightbox */}
+        {galleryPreview && (
+          <div style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.9)', zIndex: 9999, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer' }}
+            onClick={() => setGalleryPreview(null)}
+          >
+            <img src={galleryPreview} alt="preview" style={{ maxWidth: '90vw', maxHeight: '90vh', objectFit: 'contain', borderRadius: 8 }} />
+            <button style={{ position: 'absolute', top: 16, right: 16, background: 'rgba(255,255,255,0.2)', border: 'none', color: 'white', fontSize: 24, borderRadius: '50%', width: 40, height: 40, cursor: 'pointer' }}>✕</button>
+          </div>
+        )}
+      </div>
+    );
+  }
+
   // ========== MAIN RENDER ==========
   return (
     <div className="app-container">
@@ -1760,6 +1935,7 @@ function App() {
           { id: 'upscale', icon: '⬆️', label: 'Upscale 4K' },
           { id: 'faceswap', icon: '🔄', label: 'Face Swap' },
           { id: 'batch', icon: '📂', label: 'Batch' },
+          { id: 'library', icon: '🖼️', label: 'Thư viện' },
         ].map(tab => (
           <button
             key={tab.id}
@@ -1781,6 +1957,7 @@ function App() {
           {activeTab === 'upscale' && renderUpscaleTab()}
           {activeTab === 'faceswap' && renderFaceSwapTab()}
           {activeTab === 'batch' && renderBatchTab()}
+          {activeTab === 'library' && renderLibraryTab()}
         </div>
 
         {/* Right - Result + Logs */}
