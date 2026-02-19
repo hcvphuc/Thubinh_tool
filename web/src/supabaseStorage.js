@@ -3,9 +3,9 @@
 const BUCKET = 'photos';
 const MAX_STORAGE_MB = 900;
 
-// Hardcoded Supabase config (anon key is safe for frontend - secured by RLS)
+// Hardcoded Supabase config (service_role key - bypasses RLS for internal tool)
 const SUPABASE_URL = 'https://grmofxaelrangzcbfifb.supabase.co';
-const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdybW9meGFlbHJhbmd6Y2JmaWZiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE0NzExNzMsImV4cCI6MjA4NzA0NzE3M30.tU8MBJLsMrNQNAHQePG_-wY-3DGZShmdraOoJsUUEZA';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImdybW9meGFlbHJhbmd6Y2JmaWZiIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MTQ3MTE3MywiZXhwIjoyMDg3MDQ3MTczfQ.P_5X2Qz4M0-d1V3VL1MiYhajP9ScDnJ_xxqSuXM0tGA';
 
 function getConfig() { return { url: SUPABASE_URL, key: SUPABASE_KEY }; }
 function saveConfig() { /* no-op */ }
